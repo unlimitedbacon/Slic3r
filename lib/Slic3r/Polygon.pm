@@ -101,6 +101,7 @@ sub subdivide {
 sub is_printable {
     my $self = shift;
     my ($flow_width) = @_;
+    $flow_width ||= $Slic3r::flow->width;
     
     # try to get an inwards offset
     # for a distance equal to half of the extrusion width;
@@ -111,7 +112,8 @@ sub is_printable {
     # detect them and we would be discarding them.
     my $p = $self->clone;
     $p->make_counter_clockwise;
-    return $p->offset(Slic3r::Geometry::scale($flow_width || $Slic3r::flow->width) / 2) ? 1 : 0;
+    return 0 if $p->area < (Slic3r::Geometry::scale($flow_width)**2);
+    return $p->offset(Slic3r::Geometry::scale($flow_width) / 2) ? 1 : 0;
 }
 
 sub is_valid {

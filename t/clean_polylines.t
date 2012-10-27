@@ -2,7 +2,7 @@ use Test::More;
 use strict;
 use warnings;
 
-plan tests => 6;
+plan tests => 7;
 
 BEGIN {
     use FindBin;
@@ -116,4 +116,12 @@ use Slic3r;
     $polygon->merge_continuous_lines;
     note sprintf "original points: %d\nnew points: %d", scalar(@$circle), scalar(@$polygon);
     ok @$polygon >= @$circle/3, 'circle was simplified using merge_continuous_lines';
+}
+
+{
+    my $polygon = Slic3r::Polygon->new(
+        [32.345836, 11.435463], [32.345776, 11.435459], [32.359587, 11.195356],
+    );
+    $polygon->scale(1 / &Slic3r::SCALING_FACTOR);
+    ok !$polygon->is_printable(0.5), 'non-printable polygon is detected';
 }

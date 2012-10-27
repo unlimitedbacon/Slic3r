@@ -68,8 +68,15 @@ sub make_surfaces {
     
     return if !@$loops;    
     {
-        my $safety_offset = scale 0.1;
+        my ($loop_count, $point_count) = ((scalar @$loops), (scalar map @$_, @$loops));
+        $loops = [ map Slic3r::Geometry::douglas_peucker($_, 10), @$loops ];
+        $loops = Slic3r::Geometry::Clipper::simplify_polygons($loops);
+        my ($new_loop_count, $new_point_count) = ((scalar @$loops), (scalar map @$_, @$loops));
+        Slic3r::debugf "  simplified %d loops (%d points) into %d loops (%d points)\n",
+            $loop_count, $point_count, $new_loop_count, $new_point_count;
+        
         # merge everything
+        my $safety_offset = scale 0.1;
         my $expolygons = [ map $_->offset_ex(-$safety_offset), @{union_ex(safety_offset($loops, $safety_offset))} ];
         
         Slic3r::debugf "  %d surface(s) having %d holes detected from %d polylines\n",
