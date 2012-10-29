@@ -258,7 +258,7 @@ sub retract {
     
     # reset extrusion distance during retracts
     # this makes sure we leave sufficient precision in the firmware
-    $gcode .= $self->reset_e if $Slic3r::Config->gcode_flavor !~ /^(?:mach3|makerbot)$/;
+    $gcode .= $self->reset_e if $Slic3r::Config->gcode_flavor !~ /^(?:mach3)$/;
     
     return $gcode;
 }
