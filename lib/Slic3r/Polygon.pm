@@ -6,7 +6,8 @@ use warnings;
 use parent 'Slic3r::Polyline';
 
 use Slic3r::Geometry qw(polygon_lines polygon_remove_parallel_continuous_edges
-    polygon_remove_acute_vertices polygon_segment_having_point point_in_polygon);
+    polygon_remove_acute_vertices polygon_segment_having_point point_in_polygon
+    distance_between_points);
 use Slic3r::Geometry::Clipper qw(JT_MITER);
 
 sub lines {
@@ -99,6 +100,41 @@ sub subdivide {
         
         splice @$self, $i, 0, @new_points;
         $i += @new_points;
+    }
+}
+
+# Split segments longer that given width in two, and if longer than 4 * width, 
+# add points at width distance from end points.
+# This results in a polygon that's pretty well conditioned for medial axis
+# approximation, without having to divide everything into tiny 
+# width-length segments.
+sub splitdivide {
+    my $self = shift;
+    my $corner_width = shift;
+    for (my $i = 0; $i < @{$self}; $i++) {
+        my $len = distance_between_points($self->[$i-1], $self->[$i]);
+        my @pts;
+
+        # make sure corners are bracketed with fairly
+        # evenly spaced points on either side
+        if ($len > 4 * $corner_width) {
+            push @pts, [$self->[$i-1]->[0] + (($self->[$i]->[0] - $self->[$i-1]->[0]) / $len) * $corner_width,
+                        $self->[$i-1]->[1] + (($self->[$i]->[1] - $self->[$i-1]->[1]) / $len) * $corner_width];
+        }
+
+        # divide in half,
+        # so square ends can be "seen" better
+        if ($len > $corner_width) {
+            push @pts, [($self->[$i-1]->[0] + $self->[$i]->[0]) / 2,
+                        ($self->[$i-1]->[1] + $self->[$i]->[1]) / 2];
+            }
+
+        if ($len > 4 * $corner_width) {
+            push @pts, [$self->[$i-1]->[0] + (($self->[$i]->[0] - $self->[$i-1]->[0]) / $len) * ($len - $corner_width),
+                        $self->[$i-1]->[1] + (($self->[$i]->[1] - $self->[$i-1]->[1]) / $len) * ($len - $corner_width)];
+        }
+
+        splice @{$self}, $i, 0, @pts;
     }
 }
 

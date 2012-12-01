@@ -5,9 +5,10 @@ use warnings;
 # an ExPolygon is a polygon with holes
 
 use Boost::Geometry::Utils;
-use Math::Geometry::Voronoi;
-use Slic3r::Geometry qw(X Y A B point_in_polygon same_line line_length);
+use Math::Geometry::Delaunay 0.07;
+use Slic3r::Geometry qw(X Y A B point_in_polygon same_line line_length distance_between_points);
 use Slic3r::Geometry::Clipper qw(union_ex JT_MITER);
+use List::Util qw(first);
 
 # the constructor accepts an array of polygons 
 # or a Math::Clipper ExPolygon (hashref)
@@ -186,114 +187,261 @@ sub area {
     return $area;
 }
 
-# this method only works for expolygons having only a contour or
-# a contour and a hole, and not being thicker than the supplied 
-# width. it returns a polyline or a polygon
+# Medial axis approximation based on Voronoi diagram.
+# Returns a list of polylines and/or polygons.
 sub medial_axis {
     my $self = shift;
     my ($width) = @_;
     
-    my @self_lines = map $_->lines, @$self;
     my $expolygon = $self->clone;
-    my @points = ();
+
     foreach my $polygon (@$expolygon) {
         Slic3r::Geometry::polyline_remove_short_segments($polygon, $width / 2);
-        
-        # subdivide polygon segments so that we don't have anyone of them
-        # being longer than $width / 2
-        $polygon->subdivide($width/2);
-        
-        push @points, @$polygon;
+        # minimally subdivide polygon segments so that the
+        # triangulation captures important shape features, like corners 
+        $polygon->splitdivide($width/2);
     }
     
-    my $voronoi = Math::Geometry::Voronoi->new(points => \@points);
-    $voronoi->compute;
-    
-    my @skeleton_lines = ();
-    
-    my $vertices = $voronoi->vertices;
-    my $edges = $voronoi->edges;
-    foreach my $edge (@$edges) {
-        # ignore lines going to infinite
-        next if $edge->[1] == -1 || $edge->[2] == -1;
-        
-        my ($a, $b);
-        $a = $vertices->[$edge->[1]];
-        $b = $vertices->[$edge->[2]];
-        
-        next if !$self->encloses_point_quick($a) || !$self->encloses_point_quick($b);
-        
-        push @skeleton_lines, [$edge->[1], $edge->[2]];
+    my $tri = Math::Geometry::Delaunay->new();
+    $tri->doVoronoi(1);
+    $tri->doEdges(1);
+    $tri->addPolygon($expolygon->contour);
+    $tri->addHole($_) for $expolygon->holes;
+    my ($topo, $vtopo) = $tri->triangulate();
+
+    # Move vertices in Voronoi diagram ($vtopo) to make them 
+    # work much better as a medial axis approximation.
+
+    Math::Geometry::Delaunay::mic_adjust($topo, $vtopo);
+
+    # remove references to ray edges from all nodes
+
+    foreach my $node (@{$vtopo->{nodes}}) {
+        # vector [0,0] means it's not a ray, so keep it
+        @{$node->{edges}} = grep !$_->{vector}->[0] && !$_->{vector}->[1], @{$node->{edges}};
     }
     
-    # remove leafs (lines not connected to other lines at one of their endpoints)
-    {
-        my %pointmap = ();
-        $pointmap{$_}++ for map @$_, @skeleton_lines;
-        @skeleton_lines = grep {
-            $pointmap{$_->[A]} >= 2 && $pointmap{$_->[B]} >= 2
-        } @skeleton_lines;
-    }
-    return () if !@skeleton_lines;
-    
-    # now walk along the medial axis and build continuos polylines or polygons
-    my @polylines = ();
-    {
-        # build a map of line endpoints
-        my %pointmap = ();  # point_idx => [line_idx, line_idx ...]
-        for my $line_idx (0 .. $#skeleton_lines) {
-            for my $point_idx (@{$skeleton_lines[$line_idx]}) {
-                $pointmap{$point_idx} ||= [];
-                push @{$pointmap{$point_idx}}, $line_idx;
-            }
-        }
-        
-        # build the list of available lines
-        my %spare_lines = map {$_ => 1} (0 .. $#skeleton_lines);
-        
-        CYCLE: while (%spare_lines) {
-            push @polylines, [];
-            my $polyline = $polylines[-1];
-            
-            # start from a random line
-            my $first_line_idx = +(keys %spare_lines)[0];
-            delete $spare_lines{$first_line_idx};
-            push @$polyline, @{ $skeleton_lines[$first_line_idx] };
-            
-            while (1) {
-                my $last_point_id = $polyline->[-1];
-                my $lines_starting_here = $pointmap{$last_point_id};
-                
-                # remove all the visited lines from the array
-                shift @$lines_starting_here
-                    while @$lines_starting_here && !$spare_lines{$lines_starting_here->[0]};
-                
-                # do we have a line starting here?
-                my $next_line_idx = shift @$lines_starting_here;
-                if (!defined $next_line_idx) {
-                    delete $pointmap{$last_point_id};
-                    next CYCLE;
+    # Get the subset of nodes that are not too close to the polygon boundary.
+
+    my @vnodes;
+    my @new_nodes;
+
+    foreach my $node (@{$vtopo->{nodes}}) {
+        if (!defined $node->{radius}) {
+
+            # Distance from any node in the Voronoi diagram to the nearest point on the
+            # polygon can be approximated. For each edge emanating from the node, look
+            # up the corresponding edge in the Delaunay triangulation. The distance from
+            # the node point to either end of the Delaunay edge is roughly the radius
+            # of the maximum inscribed circle to the polygon at the node.
+            # (The approximate radius is greater than the true radius.)
+
+            for (my $i = $#{$node->{edges}}; $i > -1; $i--) {
+                if (distance_between_points($node->{point},$topo->{edges}->[$node->{edges}->[$i]->{index}]->{nodes}->[0]->{point}) < $width / 2) {
+                    my $edge = splice(@{$node->{edges}}, $i, 1);
                 }
-                
-                # line is not available anymore
-                delete $spare_lines{$next_line_idx};
-                
-                # add the other point to our polyline and continue walking
-                push @$polyline, grep $_ ne $last_point_id, @{$skeleton_lines[$next_line_idx]};
+            }
+        } else {
+
+            # If we ran mic_adjust(), each Voronoi node has been shifted
+            # and given a radius value for the maximum inscribed circle.
+            # Trimming based on this radius should be more accurate than 
+            # the check above, which should be a fallback in case radius 
+            # could not be determined for some reason.
+
+            if ($node->{radius} < $width / 2) {
+
+                # Remove all edges leading to neighbor nodes that 
+                # also have too-small radius.
+
+                for (my $i = $#{$node->{edges}}; $i > -1; $i--) {
+                    my $other = $node == $node->{edges}->[$i]->{nodes}->[0]
+                                ? $node->{edges}->[$i]->{nodes}->[1]
+                                : $node->{edges}->[$i]->{nodes}->[0];
+                    if ($other->{radius} < $width / 2) {
+                        splice @{$node->{edges}}, $i, 1;
+                    }
+                }
+
+                # If there are any edges left, they lead to nodes with
+                # ok radius. Split this node into copies for each edge
+                # (unless there's just one) and move each towards it's 
+                # edge's other end, to the location where interpolated
+                # radius == $width / 2
+
+                for (my $i = $#{$node->{edges}}; $i > -1; $i--) {
+                    my ($other_node_index, $this_node_index) = $node == $node->{edges}->[$i]->{nodes}->[0] ? (1, 0) : (0, 1);
+                    my $other_node = $node->{edges}->[$i]->{nodes}->[$other_node_index];
+                    my $this_node;
+
+                    # This loop should handle one or more edge trimming cases,
+                    # but with more than one it's not currently giving expected
+                    # results - it seems to make whole sets of good linked edges 
+                    # disappear. But the cases where that happens are already
+                    # fairly degenerate - lots tiny edges and nodes bunched
+                    # up in round corners.
+                    # Need to isolate a simple test case for this loop, and, 
+                    # separately, filter out the unwanted situation that usually
+                    # gives more than one edge in here.
+                    # Until then, disable handling any but the first edge.
+
+                    $i = 0 if $i > 0;
+
+                    if ($i == 0) {
+                        # reuse this node for first edge
+                        # (most often the only edge)
+                        $this_node = $node;
+
+                    } else {
+                        # clone node hash, add to and adjust topology
+                        $this_node = {
+                                      index  => scalar(@{$vtopo->{nodes}}) + scalar(@new_nodes),
+                                      point  => [@{$node->{point}}],
+                                      radius => $node->{radius},
+                                      edges  => [],
+                                      elements => [],
+                                      segments => [],
+                                      marker => undef,
+                                      attributes => []
+                                      };
+
+                        my $edge = $node->{edges}->[$i];
+                        splice @{$edge->{nodes}}, $this_node_index, 1, $this_node;
+                        push @new_nodes, $this_node;
+                        
+                        @{$this_node->{edges}} = splice @{$node->{edges}}, $i, 1;
+
+                    }
+                    
+                    my $factor = (($width / 2) - $this_node->{radius}) / ($other_node->{radius} - $this_node->{radius});
+                    $this_node->{point} = [$this_node->{point}->[0] + $factor * ($other_node->{point}->[0] - $this_node->{point}->[0]),
+                                           $this_node->{point}->[1] + $factor * ($other_node->{point}->[1] - $this_node->{point}->[1])];
+                    $this_node->{radius} = $width / 2;
+                }
+            }
+        }
+        
+        push @vnodes, $node if @{$node->{edges}};
+    }
+
+    push @vnodes, @new_nodes;
+    push @{$vtopo->{nodes}}, @new_nodes;
+
+    # All nodes where more than two edges meet are branch nodes.
+    my @branch_start_nodes = grep @{$_->{edges}} > 2, @vnodes;
+
+    # If no branch nodes, we're dealing with a line or loop.
+    # If a line, nodes at ends will have only one edge reference. 
+    if (@branch_start_nodes == 0) {
+        @branch_start_nodes = grep @{$_->{edges}} == 1, @vnodes;
+    }
+
+    # Otherwise, it's a loop - any node can be the start node.
+    if (@branch_start_nodes == 0) {
+        push @branch_start_nodes, $vnodes[0];
+    }
+
+    my @polyedges = ();
+    my @end_edges = ();
+    
+    # walk the cross referenced nodes and edges to build up polyline-like node lists
+    foreach my $start_node (@branch_start_nodes) {
+        foreach my $start_edge (@{$start_node->{edges}}) {
+            # don't go back over path already traveled
+            next if first {$_ == $start_edge} @end_edges;
+            my $this_node = $start_node;
+            push @polyedges, [];
+            push @{$polyedges[-1]}, $this_node;
+            my $this_edge = $start_edge;
+            #step along nodes: next node is the node on current edge that isn't this one
+            while ($this_node = +(grep $_ != $this_node, @{$this_edge->{nodes}})[0]) {
+                # stop at point too close to polygon
+                last if (@{$this_node->{edges}} == 0);
+                # otherwise, always add the point - duplicate start and end lets us detect polygons
+                push @{$polyedges[-1]}, $this_node;
+                # stop at a branch node, and remember the edge so we don't backtrack
+                if (@{$this_node->{edges}} > 2) {
+                    push @end_edges, $this_edge;
+                    last;
+                }
+                # stop at a dead end
+                last if @{$this_node->{edges}} == 1;
+                # step to next edge
+                $this_edge = +(grep $_ != $this_edge, @{$this_node->{edges}})[0];
+                # stop if we've looped around to start
+                last if $this_edge == $start_edge;
             }
         }
     }
-    
+
+    # Now combine chains of edges into longer chains where their ends meet,
+    # deciding which two chains to link at branch node sites.
+
+    my @polylines = ();
+
+    # sort by length, where array length is rough proxy for edge length sum
+    @polyedges = sort {@{$a} <=> @{$b}} @polyedges;
+
+    # link polyedges with common end points
+    for (my $i = $#polyedges; $i > 0; $i--) {
+        # polygons
+        if ($polyedges[$i]->[0] == $polyedges[$i]->[@{$polyedges[$i]} - 1]) {
+            push @polylines, splice(@polyedges, $i, 1);
+            next;
+        }
+        # polylines
+        else {
+
+            # We take a longer polyline from the end of the list
+            # and see if it links up with any of the shorter
+            # polylines that come before it in the list.
+            # If so, we splice the longer polyline out of the list
+            # and add it's points to the shorter polyline.
+            # Having that first splice choose the shorter next path
+            # is meant to fill out local features while in the neighborhood
+            # instead of always linking longest paths, which might
+            # require revisting a lot of separate regions of local features
+            # that were passed by, requiring more rapid traversals.
+            # The paths may need further sorting after this linking to achieve
+            # this. The point here is just to link up the path structure that 
+            # will enable that.
+            # ... sort of works - but there's probably a better approach
+            
+            my $this  = $polyedges[$i];
+
+            for (my $j = 0; $j < $i ; $j++) {
+                my $other = $polyedges[$j];
+                # all the cases of ends matching up
+                if ($this->[@{$this} - 1] == $other->[0]) {
+                    shift @{$other};
+                    @{$other} = (@{splice(@polyedges, $i, 1)}, @{$other});
+                    last;
+                } elsif ($this->[0] == $other->[@{$other} - 1]) {
+                    shift @{$this};
+                    @{$other} = (@{$other}, @{splice(@polyedges, $i, 1)});
+                    last;
+                } elsif ($this->[0] == $other->[0]) {
+                    shift @{$this};
+                    @{$other} = ((reverse @{$other}), @{splice(@polyedges, $i, 1)});
+                    last;
+                } elsif ($this->[@{$this} - 1] == $other->[@{$other} - 1]) {
+                    pop @{$other};
+                    @{$other} = (@{splice(@polyedges, $i ,1)}, (reverse @{$other}));
+                    last;
+                }
+            }
+        }
+    }
+
+    push @polylines, @polyedges;
+
     my @result = ();
     foreach my $polyline (@polylines) {
         next unless @$polyline >= 2;
         
-        # now replace point indexes with coordinates
-        @$polyline = map $vertices->[$_], @$polyline;
-        
-        # cleanup
-        $polyline = Slic3r::Geometry::douglas_peucker($polyline, $width / 7);
-        
+        # now extract just the point coordinates from the nodes
+        @$polyline = map $_->{point}, @$polyline;
+                        
         if (Slic3r::Geometry::same_point($polyline->[0], $polyline->[-1])) {
             next if @$polyline == 2;
             push @result, Slic3r::Polygon->new(@$polyline[0..$#$polyline-1]);
