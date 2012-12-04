@@ -214,7 +214,7 @@ sub medial_axis {
 
     Math::Geometry::Delaunay::mic_adjust($topo, $vtopo);
 
-    # remove references to ray edges from all nodes
+    # Remove references to ray edges from all nodes.
 
     foreach my $node (@{$vtopo->{nodes}}) {
         # vector [0,0] means it's not a ray, so keep it
@@ -225,8 +225,12 @@ sub medial_axis {
 
     my @vnodes;
     my @new_nodes;
+    my @adjust_queue = (0 .. $#{$vtopo->{nodes}});
 
-    foreach my $node (@{$vtopo->{nodes}}) {
+    while (scalar @adjust_queue) {
+        my $node_index = shift @adjust_queue;
+        my $node = $vtopo->{nodes}->[$node_index];
+
         if (!defined $node->{radius}) {
 
             # Distance from any node in the Voronoi diagram to the nearest point on the
@@ -237,7 +241,8 @@ sub medial_axis {
             # (The approximate radius is greater than the true radius.)
 
             for (my $i = $#{$node->{edges}}; $i > -1; $i--) {
-                if (distance_between_points($node->{point},$topo->{edges}->[$node->{edges}->[$i]->{index}]->{nodes}->[0]->{point}) < $width / 2) {
+                $node->{radius} = distance_between_points($node->{point},$topo->{edges}->[$node->{edges}->[$i]->{index}]->{nodes}->[0]->{point});
+                if ($node->{radius} < $width / 2) {
                     my $edge = splice(@{$node->{edges}}, $i, 1);
                 }
             }
@@ -251,78 +256,137 @@ sub medial_axis {
 
             if ($node->{radius} < $width / 2) {
 
-                # Remove all edges leading to neighbor nodes that 
-                # also have too-small radius.
-
                 for (my $i = $#{$node->{edges}}; $i > -1; $i--) {
-                    my $other = $node == $node->{edges}->[$i]->{nodes}->[0]
-                                ? $node->{edges}->[$i]->{nodes}->[1]
-                                : $node->{edges}->[$i]->{nodes}->[0];
-                    if ($other->{radius} < $width / 2) {
-                        splice @{$node->{edges}}, $i, 1;
-                    }
-                }
 
-                # If there are any edges left, they lead to nodes with
-                # ok radius. Split this node into copies for each edge
-                # (unless there's just one) and move each towards it's 
-                # edge's other end, to the location where interpolated
-                # radius == $width / 2
-
-                for (my $i = $#{$node->{edges}}; $i > -1; $i--) {
                     my ($other_node_index, $this_node_index) = $node == $node->{edges}->[$i]->{nodes}->[0] ? (1, 0) : (0, 1);
                     my $other_node = $node->{edges}->[$i]->{nodes}->[$other_node_index];
-                    my $this_node;
 
-                    # This loop should handle one or more edge trimming cases,
-                    # but with more than one it's not currently giving expected
-                    # results - it seems to make whole sets of good linked edges 
-                    # disappear. But the cases where that happens are already
-                    # fairly degenerate - lots tiny edges and nodes bunched
-                    # up in round corners.
-                    # Need to isolate a simple test case for this loop, and, 
-                    # separately, filter out the unwanted situation that usually
-                    # gives more than one edge in here.
-                    # Until then, disable handling any but the first edge.
+                    if ($other_node->{radius}  > $width / 2) {
 
-                    $i = 0 if $i > 0;
+                        # All nodes directly connected to this one should maybe 
+                        # reevaluate their situation after this one has been processed,
+                        # so add them to the end of the list again.
+                        for (my $j = $#{$node->{edges}}; $j > -1; $j--) {
+                            my $other_node_index = $node == $node->{edges}->[$j]->{nodes}->[0] ? 1 : 0;
+                            # convert to the index in $vtopo->{nodes} list
+                            $other_node_index = $node->{edges}->[$j]->{nodes}->[$other_node_index]->{index};
+                            push @adjust_queue, $other_node_index;
+                        }
 
-                    if ($i == 0) {
-                        # reuse this node for first edge
-                        # (most often the only edge)
-                        $this_node = $node;
+                        # clone
+                        my $this_node = {
+                                          index  => scalar(@{$vtopo->{nodes}}) + scalar(@new_nodes),
+                                          point  => [@{$node->{point}}],
+                                          radius => $node->{radius},
+                                          edges  => [],
+                                          elements => [],
+                                          segments => [],
+                                          marker => undef,
+                                          attributes => [],
+                                          };
 
-                    } else {
-                        # clone node hash, add to and adjust topology
-                        $this_node = {
-                                      index  => scalar(@{$vtopo->{nodes}}) + scalar(@new_nodes),
-                                      point  => [@{$node->{point}}],
-                                      radius => $node->{radius},
-                                      edges  => [],
-                                      elements => [],
-                                      segments => [],
-                                      marker => undef,
-                                      attributes => []
-                                      };
-
+                        # attach current edge to new node, detach from old
                         my $edge = $node->{edges}->[$i];
                         splice @{$edge->{nodes}}, $this_node_index, 1, $this_node;
-                        push @new_nodes, $this_node;
-                        
                         @{$this_node->{edges}} = splice @{$node->{edges}}, $i, 1;
 
+                        # TODO: ? If you want to retain any nodes with
+                        # too-small radius, you maybe need to add an edge
+                        # here that links the the new node to the old one.
+                        
+                        push @new_nodes, $this_node;
+                        push @{$vtopo->{nodes}}, $this_node;
+                        
+                        # interpolate to where radius == width
+                        my $factor = (($width / 2) - $this_node->{radius}) / ($other_node->{radius} - $this_node->{radius});
+                        $this_node->{point} = [$this_node->{point}->[0] + $factor * ($other_node->{point}->[0] - $this_node->{point}->[0]),
+                                               $this_node->{point}->[1] + $factor * ($other_node->{point}->[1] - $this_node->{point}->[1])];
+                        $this_node->{radius} = $width / 2;
                     }
-                    
-                    my $factor = (($width / 2) - $this_node->{radius}) / ($other_node->{radius} - $this_node->{radius});
-                    $this_node->{point} = [$this_node->{point}->[0] + $factor * ($other_node->{point}->[0] - $this_node->{point}->[0]),
-                                           $this_node->{point}->[1] + $factor * ($other_node->{point}->[1] - $this_node->{point}->[1])];
-                    $this_node->{radius} = $width / 2;
                 }
             }
         }
-        
+    }
+
+    push @vnodes, @new_nodes;
+
+    # Remove any nodes that still have too small 
+    # of a radius after the adjustments above.
+
+    # Though maybe we want expand this to preserve some 
+    # in some cases - like if we want to make thin walls 
+    # of extrusion width even when model walls are thinner than that.
+
+    foreach my $node (@{$vtopo->{nodes}}) {
+        if ($node->{radius} < $width / 2) {
+            for (my $i = $#{$node->{edges}}; $i > -1; $i--) {
+                # 
+                #my $other = $node == $node->{edges}->[$i]->{nodes}->[0]
+                #            ? $node->{edges}->[$i]->{nodes}->[1]
+                #            : $node->{edges}->[$i]->{nodes}->[0];
+                #if ($other->{radius} <= $width / 2) {
+
+                splice @{$node->{edges}}, $i, 1;
+
+                #}
+            }
+        }
         push @vnodes, $node if @{$node->{edges}};
     }
+
+    # Branch with short twigs filter
+    # Often a path ends in a legitimate fork, with two very
+    # short twigs coming out of a branch node. We want to
+    # convert              /    to    __---    ,
+    #                 \   /           \
+    #                  \ /             \
+    #                   |               |
+    #                   |               |
+    # to eliminate the branch, for a continuous toolpath.
+
+    foreach my $branch_node (grep @{$_->{edges}} > 2, @vnodes) {
+        my @twig_tips;
+        foreach my $edge (@{$branch_node->{edges}}) {
+            # Walk out on each edge to find short twig tips.
+            my @prune;
+            my $tip = +(grep $_ != $branch_node && @{$_->{edges}} > 0,  @{$edge->{nodes}})[0];
+            next if !$tip;
+            my $next_edge = $edge;
+            my $dist = distance_between_points($tip->{point},$branch_node->{point});
+            push @prune, $tip;
+            while (@{$tip->{edges}} != 1 && $dist < $width) {
+                $next_edge = +(grep $_ != $next_edge, @{$tip->{edges}})[0];
+                $tip = +(grep $_ != $tip && @{$_->{edges}} > 0, @{$next_edge->{nodes}})[0];
+                if (!$tip) {last;}
+                push @prune, $tip;
+                $dist = distance_between_points($tip->{point},$branch_node->{point});
+            }
+            push @twig_tips, [@prune,$dist] if (@{$tip->{edges}} == 1 && $dist < $width);
+        }
+        # Branch node will connect to closest tip,
+        # then closest will connect to next closest.
+        @twig_tips = sort {$a->[-1] <=> $b->[-1]} @twig_tips;
+        if (@twig_tips > 1) {
+            my $dist0  = pop @{$twig_tips[0]};
+            my $dist1  = pop @{$twig_tips[1]};
+
+            # Remove from branch node the edge ref that lead to tip1.
+            foreach my $e (@{$twig_tips[1]->[0]->{edges}}) {
+                @{$branch_node->{edges}} = grep $_ != $e, @{$branch_node->{edges}};
+            }
+
+            # Make tip1's only edge connect to tip0.
+            my $tip0 = pop @{$twig_tips[0]};
+            my $tip1 = pop @{$twig_tips[1]};
+            $tip1->{edges}->[0]->{nodes} = [$tip1,$tip0];
+            push @{$tip0->{edges}}, $tip1->{edges}->[0];
+
+            # Prune any nodes that were between tip1 and the branch node.
+            $_->{edges} = [] for @{$twig_tips[1]};
+        }        
+    }
+
+    @vnodes = grep @{$_->{edges}} > 0, @vnodes;
 
     push @vnodes, @new_nodes;
     push @{$vtopo->{nodes}}, @new_nodes;
@@ -344,7 +408,7 @@ sub medial_axis {
     my @polyedges = ();
     my @end_edges = ();
     
-    # walk the cross referenced nodes and edges to build up polyline-like node lists
+    # Walk the cross referenced nodes and edges to build up polyline-like node lists.
     foreach my $start_node (@branch_start_nodes) {
         foreach my $start_edge (@{$start_node->{edges}}) {
             # don't go back over path already traveled
@@ -379,10 +443,10 @@ sub medial_axis {
 
     my @polylines = ();
 
-    # sort by length, where array length is rough proxy for edge length sum
+    # Sort by length, where array length is rough proxy for edge length sum.
     @polyedges = sort {@{$a} <=> @{$b}} @polyedges;
 
-    # link polyedges with common end points
+    # Link polyedges with common end points.
     for (my $i = $#polyedges; $i > 0; $i--) {
         # polygons
         if ($polyedges[$i]->[0] == $polyedges[$i]->[@{$polyedges[$i]} - 1]) {
@@ -439,7 +503,6 @@ sub medial_axis {
     foreach my $polyline (@polylines) {
         next unless @$polyline >= 2;
         
-        # now extract just the point coordinates from the nodes
         @$polyline = map $_->{point}, @$polyline;
                         
         if (Slic3r::Geometry::same_point($polyline->[0], $polyline->[-1])) {
