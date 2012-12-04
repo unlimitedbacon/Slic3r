@@ -290,9 +290,17 @@ sub medial_axis {
                         splice @{$edge->{nodes}}, $this_node_index, 1, $this_node;
                         @{$this_node->{edges}} = splice @{$node->{edges}}, $i, 1;
 
-                        # TODO: ? If you want to retain any nodes with
-                        # too-small radius, you maybe need to add an edge
-                        # here that links the the new node to the old one.
+                        # In order to have the option to retain some nodes with 
+                        # too-small radius in a later step, add an edge that 
+                        # links the the new node to the old one.
+                        push @{$vtopo->{edges}}, {
+                                                  nodes    => [$node,$this_node],
+                                                  index    => scalar(@{$vtopo->{edges}}),
+                                                  vector   => [0,0],
+                                                  elements => [],
+                                                  };
+                        push @{$node->{edges}}, $vtopo->{edges}->[-1];
+                        push @{$this_node->{edges}}, $vtopo->{edges}->[-1];
                         
                         push @new_nodes, $this_node;
                         push @{$vtopo->{nodes}}, $this_node;
@@ -320,19 +328,16 @@ sub medial_axis {
     foreach my $node (@{$vtopo->{nodes}}) {
         if ($node->{radius} < $width / 2) {
             for (my $i = $#{$node->{edges}}; $i > -1; $i--) {
-                # 
-                #my $other = $node == $node->{edges}->[$i]->{nodes}->[0]
-                #            ? $node->{edges}->[$i]->{nodes}->[1]
-                #            : $node->{edges}->[$i]->{nodes}->[0];
-                #if ($other->{radius} <= $width / 2) {
-
-                splice @{$node->{edges}}, $i, 1;
-
-                #}
+                my $other = $node == $node->{edges}->[$i]->{nodes}->[0]
+                            ? $node->{edges}->[$i]->{nodes}->[1]
+                            : $node->{edges}->[$i]->{nodes}->[0];
+                @{$other->{edges}} = grep $_ != $node->{edges}->[$i] ,@{$other->{edges}};
             }
+            $node->{edges} = [];
         }
-        push @vnodes, $node if @{$node->{edges}};
     }
+
+    push @vnodes, grep @{$_->{edges}}, @{$vtopo->{nodes}};
 
     # Branch with short twigs filter
     # Often a path ends in a legitimate fork, with two very
@@ -347,7 +352,7 @@ sub medial_axis {
     foreach my $branch_node (grep @{$_->{edges}} > 2, @vnodes) {
         my @twig_tips;
         foreach my $edge (@{$branch_node->{edges}}) {
-            # Walk out on each edge to find short twig tips.
+            # Walk out on each edge to find short (but possibly multi-edge) twigs.
             my @prune;
             my $tip = +(grep $_ != $branch_node && @{$_->{edges}} > 0,  @{$edge->{nodes}})[0];
             next if !$tip;
@@ -361,7 +366,7 @@ sub medial_axis {
                 push @prune, $tip;
                 $dist = distance_between_points($tip->{point},$branch_node->{point});
             }
-            push @twig_tips, [@prune,$dist] if (@{$tip->{edges}} == 1 && $dist < $width);
+            push @twig_tips, [@prune,$dist] if (@{$prune[-1]->{edges}} == 1 && $dist < $width);
         }
         # Branch node will connect to closest tip,
         # then closest will connect to next closest.
