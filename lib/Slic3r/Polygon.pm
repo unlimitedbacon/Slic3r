@@ -111,7 +111,7 @@ sub subdivide {
 sub splitdivide {
     my $self = shift;
     my $corner_width = shift;
-    for (my $i = 0; $i < @{$self}; $i++) {
+    for (my $i = $#{$self}; $i > -1; $i--) {
         my $len = distance_between_points($self->[$i-1], $self->[$i]);
         my @pts;
 
