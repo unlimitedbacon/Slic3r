@@ -217,6 +217,7 @@ sub medial_axis {
     # Remove references to ray edges from all nodes.
 
     foreach my $node (@{$vtopo->{nodes}}) {
+        # remove refs to ray edges from nodes
         # vector [0,0] means it's not a ray, so keep it
         @{$node->{edges}} = grep !$_->{vector}->[0] && !$_->{vector}->[1], @{$node->{edges}};
     }
@@ -275,7 +276,7 @@ sub medial_axis {
 
                         # clone
                         my $this_node = {
-                                          index  => scalar(@{$vtopo->{nodes}}) + scalar(@new_nodes),
+                                          index  => scalar(@{$vtopo->{nodes}}),
                                           point  => [@{$node->{point}}],
                                           radius => $node->{radius},
                                           edges  => [],
@@ -315,8 +316,6 @@ sub medial_axis {
             }
         }
     }
-
-    push @vnodes, @new_nodes;
 
     # Remove any nodes that still have too small 
     # of a radius after the adjustments above.
@@ -393,9 +392,6 @@ sub medial_axis {
 
     @vnodes = grep @{$_->{edges}} > 0, @vnodes;
 
-    push @vnodes, @new_nodes;
-    push @{$vtopo->{nodes}}, @new_nodes;
-
     # All nodes where more than two edges meet are branch nodes.
     my @branch_start_nodes = grep @{$_->{edges}} > 2, @vnodes;
 
@@ -428,13 +424,11 @@ sub medial_axis {
                 last if (@{$this_node->{edges}} == 0);
                 # otherwise, always add the point - duplicate start and end lets us detect polygons
                 push @{$polyedges[-1]}, $this_node;
-                # stop at a branch node, and remember the edge so we don't backtrack
-                if (@{$this_node->{edges}} > 2) {
+                # stop at a branch node or dead end, and remember the edge so we don't backtrack
+                if (@{$this_node->{edges}} > 2 || @{$this_node->{edges}} == 1 ) {
                     push @end_edges, $this_edge;
                     last;
                 }
-                # stop at a dead end
-                last if @{$this_node->{edges}} == 1;
                 # step to next edge
                 $this_edge = +(grep $_ != $this_edge, @{$this_node->{edges}})[0];
                 # stop if we've looped around to start
