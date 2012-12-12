@@ -245,12 +245,17 @@ sub make_perimeters {
                 my @this_width = map $_->offset_ex(+0.5*$flow->scaled_width),
                     map $_->noncollapsing_offset_ex(-0.5*$flow->scaled_width),
                     @gaps;
+
+                @this_width = @{ union_ex([map @$_, @this_width]) };
+
+                my $area_threshold = $self->perimeter_flow->scaled_spacing ** 2;
+                @this_width = grep $_->area > ($area_threshold), @this_width;
                 
                 if (1) {  # remember to re-enable t/dynamic.t
                     # fill gaps using dynamic extrusion width, by treating them like thin polygons,
                     # thus generating the skeleton and using it to fill them
                     my %path_args = (
-                        role            => EXTR_ROLE_SOLIDFILL,
+                        role            => EXTR_ROLE_GAPFILL,
                         flow_spacing    => $flow->spacing,
                     );
                     push @{ $self->thin_fills }, map {
