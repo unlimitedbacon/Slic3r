@@ -257,6 +257,7 @@ sub make_perimeters {
                     my %path_args = (
                         role            => EXTR_ROLE_GAPFILL,
                         flow_spacing    => $flow->spacing,
+                        height          => $self->height,
                     );
                     push @{ $self->thin_fills }, map {
                         $_->isa('Slic3r::Polygon')
