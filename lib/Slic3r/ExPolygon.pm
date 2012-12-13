@@ -5,7 +5,7 @@ use warnings;
 # an ExPolygon is a polygon with holes
 
 use Boost::Geometry::Utils;
-use Math::Geometry::Delaunay 0.07;
+use Math::Geometry::Delaunay 0.08;
 use Slic3r::Geometry qw(X Y A B point_in_polygon same_line line_length distance_between_points);
 use Slic3r::Geometry::Clipper qw(union_ex JT_MITER);
 use List::Util qw(first);
