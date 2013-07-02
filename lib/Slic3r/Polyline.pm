@@ -5,6 +5,7 @@ use warnings;
 use Scalar::Util qw(reftype);
 use Slic3r::Geometry qw(A B X Y X1 X2 Y1 Y2 polyline_remove_parallel_continuous_edges polyline_remove_acute_vertices
     polyline_lines move_points same_point);
+use Slic3r::Geometry::Clipper qw(JT_SQUARE);
 
 # the constructor accepts an array(ref) of points
 sub new {
@@ -44,11 +45,6 @@ sub lines {
     return polyline_lines($self);
 }
 
-sub boost_linestring {
-    my $self = shift;
-    return Boost::Geometry::Utils::linestring($self);
-}
-
 sub wkt {
     my $self = shift;
     return sprintf "LINESTRING((%s))", join ',', map "$_->[0] $_->[1]", @$self;
@@ -68,8 +64,8 @@ sub simplify {
     my $self = shift;
     my $tolerance = shift || 10;
     
-    @$self = @{ Slic3r::Geometry::douglas_peucker($self, $tolerance) };
-    bless $_, 'Slic3r::Point' for @$self;
+    my $simplified = Boost::Geometry::Utils::linestring_simplify($self, $tolerance);
+    return (ref $self)->new($simplified);
 }
 
 sub reverse {
@@ -79,15 +75,19 @@ sub reverse {
 
 sub length {
     my $self = shift;
-    my $length = 0;
-    $length += $_->length for $self->lines;
-    return $length;
+    return Boost::Geometry::Utils::linestring_length($self);
 }
 
-# this only applies to polylines
 sub grow {
     my $self = shift;
-    return Slic3r::Polygon->new(@$self, CORE::reverse @$self[1..($#$self-1)])->offset(@_);
+    my ($distance, $scale, $joinType, $miterLimit) = @_;
+    $joinType //= JT_SQUARE;
+    
+    return map Slic3r::Polygon->new($_),
+        Slic3r::Geometry::Clipper::offset(
+            [ Slic3r::Polygon->new(@$self, CORE::reverse @$self[1..($#$self-1)]) ],
+            $distance, $scale, $joinType, $miterLimit,
+        );
 }
 
 sub nearest_point_to {
@@ -115,10 +115,7 @@ sub clip_with_expolygon {
     my $self = shift;
     my ($expolygon) = @_;
     
-    my $result = Boost::Geometry::Utils::polygon_linestring_intersection(
-        $expolygon->boost_polygon,
-        $self->boost_linestring,
-    );
+    my $result = Boost::Geometry::Utils::polygon_multi_linestring_intersection($expolygon, [$self]);
     bless $_, 'Slic3r::Polyline' for @$result;
     bless $_, 'Slic3r::Point' for map @$_, @$result;
     return @$result;
@@ -126,7 +123,7 @@ sub clip_with_expolygon {
 
 sub bounding_box {
     my $self = shift;
-    return Slic3r::Geometry::bounding_box($self);
+    return Slic3r::Geometry::BoundingBox->new_from_points($self);
 }
 
 sub size {
@@ -136,8 +133,8 @@ sub size {
 
 sub align_to_origin {
     my $self = shift;
-    my @bb = $self->bounding_box;
-    return $self->translate(-$bb[X1], -$bb[Y1]);
+    my $bb = $self->bounding_box;
+    return $self->translate(-$bb->x_min, -$bb->y_min);
 }
 
 sub rotate {
@@ -159,15 +156,17 @@ sub translate {
 sub scale {
     my $self = shift;
     my ($factor) = @_;
-    return if $factor == 1;
     
     # transform point coordinates
-    foreach my $point (@$self) {
-        $point->[$_] *= $factor for X,Y;
+    if ($factor != 1) {
+        foreach my $point (@$self) {
+            $point->[$_] *= $factor for X,Y;
+        }
     }
     return $self;
 }
 
+# removes the given distance from the end of the polyline
 sub clip_end {
     my $self = shift;
     my ($distance) = @_;
@@ -188,6 +187,30 @@ sub clip_end {
     }
 }
 
+# only keeps the given distance at the beginning of the polyline
+sub clip_start {
+    my $self = shift;
+    my ($distance) = @_;
+    
+    my $points = [ $self->[0] ];
+    
+    for (my $i = 1; $distance > 0 && $i <= $#$self; $i++) {
+        my $point = $self->[$i];
+        my $segment_length = $point->distance_to($self->[$i-1]);
+        if ($segment_length <= $distance) {
+            $distance -= $segment_length;
+            push @$points, $point;
+            next;
+        }
+        
+        my $new_point = Slic3r::Geometry::point_along_segment($self->[$i-1], $point, $distance);
+        push @$points, Slic3r::Point->new($new_point);
+        $distance = 0;
+    }
+    
+    return (ref $self)->new($points);
+}
+
 package Slic3r::Polyline::Collection;
 use Moo;
 
@@ -196,9 +219,9 @@ has 'polylines' => (is => 'ro', default => sub { [] });
 # If the second argument is provided, this method will return its items sorted
 # instead of returning the actual sorted polylines. 
 # Note that our polylines will be reversed in place when necessary.
-sub shortest_path {
+sub chained_path {
     my $self = shift;
-    my ($start_near, $items) = @_;
+    my ($start_near, $items, $no_reverse) = @_;
     
     $items ||= $self->polylines;
     my %items_map = map { $self->polylines->[$_] => $items->[$_] } 0 .. $#{$self->polylines};
@@ -206,7 +229,9 @@ sub shortest_path {
     
     my @paths = ();
     my $start_at;
-    my $endpoints = [ map { $_->[0], $_->[-1] } @my_paths ];
+    my $endpoints = $no_reverse
+        ? [ map { $_->[0], $_->[0]  } @my_paths ]
+        : [ map { $_->[0], $_->[-1] } @my_paths ];
     while (@my_paths) {
         # find nearest point
         my $start_index = $start_near
@@ -214,7 +239,7 @@ sub shortest_path {
             : 0;
 
         my $path_index = int($start_index/2);
-        if ($start_index%2) { # index is end so reverse to make it the start
+        if ($start_index % 2 && !$no_reverse) { # index is end so reverse to make it the start
             $my_paths[$path_index]->reverse;
         }
         push @paths, splice @my_paths, $path_index, 1;

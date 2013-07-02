@@ -1,17 +1,19 @@
 package Slic3r::TriangleMesh;
 use Moo;
 
+use List::Util qw(reduce min max);
 use Slic3r::Geometry qw(X Y Z A B unscale same_point);
 use Slic3r::Geometry::Clipper qw(union_ex);
+use Storable;
 
 # public
 has 'vertices'      => (is => 'ro', required => 1);         # id => [$x,$y,$z]
 has 'facets'        => (is => 'ro', required => 1);         # id => [ $v1_id, $v2_id, $v3_id ]
 
 # private
-has 'edges'         => (is => 'ro', default => sub { [] }); # id => [ $v1_id, $v2_id ]
-has 'facets_edges'  => (is => 'ro', default => sub { [] }); # id => [ $e1_id, $e2_id, $e3_id ]
-has 'edges_facets'  => (is => 'ro', default => sub { [] }); # id => [ $f1_id, $f2_id, (...) ]
+has 'edges'         => (is => 'rw'); # id => [ $v1_id, $v2_id ]
+has 'facets_edges'  => (is => 'rw'); # id => [ $e1_id, $e2_id, $e3_id ]
+has 'edges_facets'  => (is => 'rw'); # id => [ $f1_id, $f2_id, (...) ]
 
 use constant MIN => 0;
 use constant MAX => 1;
@@ -28,14 +30,15 @@ use constant I_FACET_EDGE       => 6;
 use constant FE_TOP             => 0;
 use constant FE_BOTTOM          => 1;
 
-# always make sure BUILD is idempotent
-sub BUILD {
+sub analyze {
     my $self = shift;
     
-    @{$self->edges} = ();
-    @{$self->facets_edges} = ();
-    @{$self->edges_facets} = ();
+    return if defined $self->edges;
+    $self->edges([]);
+    $self->facets_edges([]);
+    $self->edges_facets([]);
     my %table = ();  # edge_coordinates => edge_id
+    my $vertices = $self->vertices;  # save method calls
     
     for (my $facet_id = 0; $facet_id <= $#{$self->facets}; $facet_id++) {
         my $facet = $self->facets->[$facet_id];
@@ -45,8 +48,10 @@ sub BUILD {
         # this is needed to get all intersection lines in a consistent order
         # (external on the right of the line)
         {
-            my @z_order = sort { $self->vertices->[$facet->[$a]][Z] <=> $self->vertices->[$facet->[$b]][Z] } -3..-1;
-            @$facet[-3..-1] = (@$facet[$z_order[0]..-1], @$facet[-3..($z_order[0]-1)]);
+            my $lowest_vertex_idx = reduce {
+                $vertices->[ $facet->[$a] ][Z] < $vertices->[ $facet->[$b] ][Z] ? $a : $b
+            } -3 .. -1;
+            @$facet[-3..-1] = (@$facet[$lowest_vertex_idx..-1], @$facet[-3..($lowest_vertex_idx-1)]);
         }
         
         # ignore the normal if provided
@@ -92,11 +97,7 @@ sub merge {
 }
 
 sub clone {
-    my $self = shift;
-    return (ref $self)->new(
-        vertices => [ map [ @$_ ], @{$self->vertices} ],
-        facets   => [ map [ @$_ ], @{$self->facets} ],
-    );
+  Storable::dclone($_[0])
 }
 
 sub _facet_edges {
@@ -148,25 +149,31 @@ sub clean {
 sub check_manifoldness {
     my $self = shift;
     
+    $self->analyze;
+    
     # look for any edges not connected to exactly two facets
     my ($first_bad_edge_id) =
         grep { @{ $self->edges_facets->[$_] } != 2 } 0..$#{$self->edges_facets};
     if (defined $first_bad_edge_id) {
-        warn sprintf "Warning: The input file contains a hole near edge %f-%f (not manifold). "
+        warn sprintf "Warning: The input file contains a hole near edge %f,%f,%f-%f,%f,%f (not manifold). "
             . "You might want to repair it and retry, or to check the resulting G-code before printing anyway.\n",
-            @{$self->edges->[$first_bad_edge_id]};
+            map @{$self->vertices->[$_]}, @{$self->edges->[$first_bad_edge_id]};
         return 0;
     }
+    
+    # empty the edges array as we don't really need it anymore
+    @{$self->edges} = ();
+    
     return 1;
 }
 
 sub unpack_line {
     my ($packed) = @_;
     
-    my @data = unpack I_FMT, $packed;
-    splice @data, 0, 2, [ @data[0,1] ];
-    $data[$_] = undef for grep $data[$_] == -1, I_A_ID, I_B_ID, I_FACET_EDGE, I_PREV_FACET_INDEX, I_NEXT_FACET_INDEX;
-    return [@data];
+    my $data = [ unpack I_FMT, $packed ];
+    splice @$data, 0, 2, [ @$data[0,1] ];
+    $data->[$_] = undef for grep $data->[$_] == -1, I_A_ID, I_B_ID, I_FACET_EDGE, I_PREV_FACET_INDEX, I_NEXT_FACET_INDEX;
+    return $data;
 }
 
 sub make_loops {
@@ -321,14 +328,14 @@ sub make_loops {
 
 sub rotate {
     my $self = shift;
-    my ($deg) = @_;
+    my ($deg, $center) = @_;
     return if $deg == 0;
     
     my $rad = Slic3r::Geometry::deg2rad($deg);
     
     # transform vertex coordinates
     foreach my $vertex (@{$self->vertices}) {
-        @$vertex = (@{ +(Slic3r::Geometry::rotate_points($rad, undef, [ $vertex->[X], $vertex->[Y] ]))[0] }, $vertex->[Z]);
+        @$vertex = (@{ +(Slic3r::Geometry::rotate_points($rad, $center, [ $vertex->[X], $vertex->[Y] ]))[0] }, $vertex->[Z]);
     }
 }
 
@@ -358,8 +365,19 @@ sub align_to_origin {
     
     # calculate the displacements needed to 
     # have lowest value for each axis at coordinate 0
-    my @extents = $self->extents;
-    $self->move(map -$extents[$_][MIN], X,Y,Z);
+    my $bb = $self->bounding_box;
+    $self->move(map -$bb->extents->[$_][MIN], X,Y,Z);
+}
+
+sub center_around_origin {
+    my $self = shift;
+    
+    $self->move(map -$_, @{ $self->center });
+}
+
+sub center {
+    my $self = shift;
+    return $self->bounding_box->center;
 }
 
 sub duplicate {
@@ -382,14 +400,19 @@ sub duplicate {
     $self->BUILD;
 }
 
-sub extents {
+sub used_vertices {
     my $self = shift;
-    return Slic3r::Geometry::bounding_box_3D($self->vertices);
+    return [ map $self->vertices->[$_], map @$_, @{$self->facets} ];
+}
+
+sub bounding_box {
+    my $self = shift;
+    return Slic3r::Geometry::BoundingBox->new_from_points_3D($self->used_vertices);
 }
 
 sub size {
     my $self = shift;
-    return Slic3r::Geometry::size_3D($self->vertices);
+    return $self->bounding_box->size;
 }
 
 sub slice_facet {
@@ -401,13 +424,11 @@ sub slice_facet {
         if $Slic3r::debug;
     
     # find the vertical extents of the facet
-    my ($min_z, $max_z) = (99999999999, -99999999999);
-    foreach my $vertex (@vertices) {
-        my $vertex_z = $self->vertices->[$vertex][Z];
-        $min_z = $vertex_z if $vertex_z < $min_z;
-        $max_z = $vertex_z if $vertex_z > $max_z;
-    }
-    Slic3r::debugf "z: min = %.0f, max = %.0f\n", $min_z, $max_z;
+    my @z = map $_->[Z], @{$self->vertices}[@vertices];
+    my $min_z = min(@z);
+    my $max_z = max(@z);
+    Slic3r::debugf "z: min = %.0f, max = %.0f\n", $min_z, $max_z
+        if $Slic3r::debug;
     
     if ($max_z == $min_z) {
         Slic3r::debugf "Facet is horizontal; ignoring\n";
@@ -415,14 +436,13 @@ sub slice_facet {
     }
     
     # calculate the layer extents
-    my $min_layer = int((unscale($min_z) - ($Slic3r::Config->get_value('first_layer_height') + $Slic3r::Config->layer_height / 2)) / $Slic3r::Config->layer_height) - 2;
-    $min_layer = 0 if $min_layer < 0;
-    my $max_layer = int((unscale($max_z) - ($Slic3r::Config->get_value('first_layer_height') + $Slic3r::Config->layer_height / 2)) / $Slic3r::Config->layer_height) + 2;
-    Slic3r::debugf "layers: min = %s, max = %s\n", $min_layer, $max_layer;
+    my ($min_layer, $max_layer) = $print_object->get_layer_range($min_z, $max_z);
+    Slic3r::debugf "layers: min = %s, max = %s\n", $min_layer, $max_layer
+        if $Slic3r::debug;
     
     my $lines = {};  # layer_id => [ lines ]
-    for (my $layer_id = $min_layer; $layer_id <= $max_layer; $layer_id++) {
-        my $layer = $print_object->layer($layer_id);
+    for my $layer_id ($min_layer .. $max_layer) {
+        my $layer = $print_object->layers->[$layer_id];
         $lines->{$layer_id} ||= [];
         push @{ $lines->{$layer_id} }, $self->intersect_facet($facet_id, $layer->slice_z);
     }
@@ -434,25 +454,27 @@ sub intersect_facet {
     my ($facet_id, $z) = @_;
     
     my @vertices_ids        = @{$self->facets->[$facet_id]}[-3..-1];
+    my %vertices            = map { $_ => $self->vertices->[$_] } @vertices_ids;  # cache vertices
     my @edge_ids            = @{$self->facets_edges->[$facet_id]};
     my @edge_vertices_ids   = $self->_facet_edges($facet_id);
     
-    my (@lines, @points, @intersection_points, @points_on_layer) = ();
+    my (@points, @intersection_points, @points_on_layer) = ();
         
     for my $e (0..2) {
-        my $edge_id         = $edge_ids[$e];
         my ($a_id, $b_id)   = @{$edge_vertices_ids[$e]};
-        my ($a, $b)         = map $self->vertices->[$_], ($a_id, $b_id);
+        my ($a, $b)         = @vertices{$a_id, $b_id};
         #printf "Az = %f, Bz = %f, z = %f\n", $a->[Z], $b->[Z], $z;
         
         if ($a->[Z] == $b->[Z] && $a->[Z] == $z) {
             # edge is horizontal and belongs to the current layer
-            my $edge_type = (grep $self->vertices->[$_][Z] < $z, @vertices_ids) ? FE_TOP : FE_BOTTOM;
+            my $edge_type = (grep $vertices{$_}[Z] < $z, @vertices_ids) ? FE_TOP : FE_BOTTOM;
             if ($edge_type == FE_TOP) {
                 ($a, $b) = ($b, $a);
                 ($a_id, $b_id) = ($b_id, $a_id);
             }
-            push @lines, pack I_FMT, (
+            # We assume that this method is never being called for horizontal
+            # facets, so no other edge is going to be on this layer.
+            return pack I_FMT, (
                 $b->[X], $b->[Y],       # I_B
                 $a_id,                  # I_A_ID
                 $b_id,                  # I_B_ID
@@ -482,14 +504,13 @@ sub intersect_facet {
                 $b->[X] + ($a->[X] - $b->[X]) * ($z - $b->[Z]) / ($a->[Z] - $b->[Z]),
                 $b->[Y] + ($a->[Y] - $b->[Y]) * ($z - $b->[Z]) / ($a->[Z] - $b->[Z]),
                 undef,
-                $edge_id,
+                $edge_ids[$e],
             ];
             push @intersection_points, $#points;
             #print "Intersects at $z!\n";
         }
     }
     
-    return @lines if @lines;
     if (@points_on_layer == 2 && @intersection_points == 1) {
         $points[ $points_on_layer[1] ] = undef;
         @points = grep $_, @points;
@@ -542,6 +563,8 @@ sub get_connected_facets {
 sub split_mesh {
     my $self = shift;
     
+    $self->analyze;
+    
     my @meshes = ();
     
     # loop while we have remaining facets
@@ -587,8 +610,8 @@ sub horizontal_projection {
         push @f, Slic3r::Polygon->new([ map [ @{$self->vertices->[$_]}[X,Y] ], @$facet ]);
     }
     
-    $_->make_counter_clockwise for @f;
     my $scale_vector = Math::Clipper::integerize_coordinate_sets({ bits => 32 }, @f);
+    $_->make_counter_clockwise for @f;  # do this after scaling, as winding order might change while doing that
     my $union = union_ex([ Slic3r::Geometry::Clipper::offset(\@f, 10000) ]);
     Math::Clipper::unscale_coordinate_sets($scale_vector, $_) for @$union;
     return $union;

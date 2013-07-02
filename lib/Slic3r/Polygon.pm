@@ -6,17 +6,13 @@ use warnings;
 use parent 'Slic3r::Polyline';
 
 use Slic3r::Geometry qw(polygon_lines polygon_remove_parallel_continuous_edges
-    polygon_remove_acute_vertices polygon_segment_having_point point_in_polygon);
+    polygon_remove_acute_vertices polygon_segment_having_point point_in_polygon
+    PI X1 X2 Y1 Y2 epsilon);
 use Slic3r::Geometry::Clipper qw(JT_MITER);
 
 sub lines {
     my $self = shift;
     return polygon_lines($self);
-}
-
-sub boost_linestring {
-    my $self = shift;
-    return Boost::Geometry::Utils::linestring([@$self, $self->[0]]);
 }
 
 sub wkt {
@@ -60,16 +56,10 @@ sub remove_acute_vertices {
     bless $_, 'Slic3r::Point' for @$self;
 }
 
-sub point_on_segment {
-    my $self = shift;
-    my ($point) = @_;
-    return polygon_segment_having_point($self, $point);
-}
-
 sub encloses_point {
     my $self = shift;
     my ($point) = @_;
-    return point_in_polygon($point, $self);
+    return Boost::Geometry::Utils::point_covered_by_polygon($point, [$self]);
 }
 
 sub area {
@@ -77,14 +67,14 @@ sub area {
     return Slic3r::Geometry::Clipper::area($self);
 }
 
-sub safety_offset {
+sub grow {
     my $self = shift;
-    return (ref $self)->new(Slic3r::Geometry::Clipper::safety_offset([$self])->[0]);
+    return $self->split_at_first_point->grow(@_);
 }
 
-sub offset {
+sub simplify {
     my $self = shift;
-    return map Slic3r::Polygon->new($_), Slic3r::Geometry::Clipper::offset([$self], @_);
+    return Slic3r::Geometry::Clipper::simplify_polygon( $self->SUPER::simplify(@_) );
 }
 
 # this method subdivides the polygon segments to that no one of them
@@ -110,10 +100,10 @@ sub subdivide {
     }
 }
 
-# returns false if the polyline is too tight to be printed
+# returns false if the polygon is too tight to be printed
 sub is_printable {
     my $self = shift;
-    my ($flow_width) = @_;
+    my ($width) = @_;
     
     # try to get an inwards offset
     # for a distance equal to half of the extrusion width;
@@ -124,7 +114,7 @@ sub is_printable {
     # detect them and we would be discarding them.
     my $p = $self->clone;
     $p->make_counter_clockwise;
-    return $p->offset(Slic3r::Geometry::scale($flow_width || $Slic3r::flow->width) / 2) ? 1 : 0;
+    return Slic3r::Geometry::Clipper::offset([$p], -$width / 2) ? 1 : 0;
 }
 
 sub is_valid {
@@ -136,7 +126,7 @@ sub split_at_index {
     my $self = shift;
     my ($index) = @_;
     
-    return (ref $self)->new(
+    return Slic3r::Polyline->new(
         @$self[$index .. $#$self], 
         @$self[0 .. $index],
     );
@@ -162,6 +152,15 @@ sub split_at {
 sub split_at_first_point {
     my $self = shift;
     return $self->split_at_index(0);
+}
+
+# for cw polygons this will return convex points!
+sub concave_points {
+    my $self = shift;
+    
+    return map $self->[$_],
+        grep Slic3r::Geometry::angle3points(@$self[$_, $_-1, $_+1]) < PI - epsilon,
+        -1 .. ($#$self-1);
 }
 
 1;

@@ -14,32 +14,57 @@ our $last_output_file;
 our $last_config;
 
 use constant FILE_WILDCARDS => {
+    known   => 'Known files (*.stl, *.obj, *.amf, *.xml)|*.stl;*.STL;*.obj;*.OBJ;*.amf;*.AMF;*.xml;*.XML',
     stl     => 'STL files (*.stl)|*.stl;*.STL',
     obj     => 'OBJ files (*.obj)|*.obj;*.OBJ',
     amf     => 'AMF files (*.amf)|*.amf;*.AMF;*.xml;*.XML',
     ini     => 'INI files *.ini|*.ini;*.INI',
-    gcode   => 'G-code files *.gcode|*.gcode;*.GCODE|G-code files *.g|*.g;*.G',
+    gcode   => 'G-code files (*.gcode, *.gco, *.g)|*.gcode;*.GCODE;*.gco;*.GCO;*.g;*.G',
     svg     => 'SVG files *.svg|*.svg;*.SVG',
 };
-use constant MODEL_WILDCARD => join '|', @{&FILE_WILDCARDS}{qw(stl obj amf)};
+use constant MODEL_WILDCARD => join '|', @{&FILE_WILDCARDS}{qw(known stl obj amf)};
 
 sub new {
     my $class = shift;
-    my ($parent) = @_;
+    my ($parent, %params) = @_;
     my $self = $class->SUPER::new($parent, -1, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL);
+    $self->{mode} = $params{mode};
+    $self->{mode} = 'expert' if $self->{mode} !~ /^(?:simple|expert)$/;
     
     $self->{tabpanel} = Wx::Notebook->new($self, -1, wxDefaultPosition, wxDefaultSize, wxNB_TOP | wxTAB_TRAVERSAL);
-    $self->{tabpanel}->AddPage($self->{plater} = Slic3r::GUI::Plater->new($self->{tabpanel}), "Plater");
+    $self->{tabpanel}->AddPage($self->{plater} = Slic3r::GUI::Plater->new($self->{tabpanel}), "Plater")
+        unless $params{no_plater};
     $self->{options_tabs} = {};
     
-    for my $tab_name (qw(print filament printer)) {
-        $self->{options_tabs}{$tab_name} = ("Slic3r::GUI::Tab::" . ucfirst $tab_name)->new(
-            $self->{tabpanel},
-            plater              => $self->{plater},
-            on_value_change     => sub { $self->{plater}->on_config_change(@_) }, # propagate config change events to the plater
-        );
-        $self->{tabpanel}->AddPage($self->{options_tabs}{$tab_name}, $self->{options_tabs}{$tab_name}->title);
+    my $simple_config;
+    if ($self->{mode} eq 'simple') {
+        $simple_config = Slic3r::Config->load("$Slic3r::GUI::datadir/simple.ini")
+            if -e "$Slic3r::GUI::datadir/simple.ini";
     }
+    
+    my $class_prefix = $self->{mode} eq 'simple' ? "Slic3r::GUI::SimpleTab::" : "Slic3r::GUI::Tab::";
+    my $init = 0;
+    for my $tab_name (qw(print filament printer)) {
+        my $tab = $self->{options_tabs}{$tab_name} = ($class_prefix . ucfirst $tab_name)->new(
+            $self->{tabpanel},
+            on_value_change     => sub {
+                $self->{plater}->on_config_change(@_) if $self->{plater}; # propagate config change events to the plater
+                if ($init) {  # don't save while loading for the first time
+                    if ($self->{mode} eq 'simple') {
+                        # save config
+                        $self->config->save("$Slic3r::GUI::datadir/simple.ini");
+                    }
+                    $self->config->save($Slic3r::GUI::autosave) if $Slic3r::GUI::autosave;
+                }
+            },
+            on_presets_changed  => sub {
+                $self->{plater}->update_presets($tab_name, @_) if $self->{plater};
+            },
+        );
+        $self->{tabpanel}->AddPage($tab, $tab->title);
+        $tab->load_config($simple_config) if $simple_config;
+    }
+    $init = 1;
     
     my $sizer = Wx::BoxSizer->new(wxVERTICAL);
     $sizer->Add($self->{tabpanel}, 1, wxEXPAND);
@@ -51,7 +76,7 @@ sub new {
     return $self;
 }
 
-sub do_slice {
+sub quick_slice {
     my $self = shift;
     my %params = @_;
     
@@ -100,7 +125,7 @@ sub do_slice {
         $Slic3r::GUI::Settings->{recent}{skein_directory} = dirname($input_file);
         Slic3r::GUI->save_settings;
         
-        my $print = Slic3r::Print->new(config => $config);
+        my $print = $self->init_print;
         $print->add_model(Slic3r::Model->read_from_file($input_file));
         $print->validate;
 
@@ -111,7 +136,8 @@ sub do_slice {
         } elsif ($params{save_as}) {
             $output_file = $print->expanded_output_filepath($output_file);
             $output_file =~ s/\.gcode$/.svg/i if $params{export_svg};
-            my $dlg = Wx::FileDialog->new($self, 'Save ' . ($params{export_svg} ? 'SVG' : 'G-code') . ' file as:', dirname($output_file),
+            my $dlg = Wx::FileDialog->new($self, 'Save ' . ($params{export_svg} ? 'SVG' : 'G-code') . ' file as:',
+                Slic3r::GUI->output_path(dirname($output_file)),
                 basename($output_file), $params{export_svg} ? FILE_WILDCARDS->{svg} : FILE_WILDCARDS->{gcode}, wxFD_SAVE);
             if ($dlg->ShowModal != wxID_OK) {
                 $dlg->Destroy;
@@ -119,6 +145,8 @@ sub do_slice {
             }
             $output_file = $dlg->GetPath;
             $last_output_file = $output_file unless $params{export_svg};
+            $Slic3r::GUI::Settings->{_}{last_output_path} = dirname($output_file);
+            Slic3r::GUI->save_settings;
             $dlg->Destroy;
         }
         
@@ -164,6 +192,21 @@ sub do_slice {
     Slic3r::GUI::catch_error($self, sub { $process_dialog->Destroy if $process_dialog });
 }
 
+sub init_print {
+    my $self = shift;
+    
+    my %extra_variables = ();
+    if ($self->{mode} eq 'expert') {
+        $extra_variables{"${_}_preset"} = $self->{options_tabs}{$_}->current_preset->{name}
+            for qw(print filament printer);
+    }
+    
+    return Slic3r::Print->new(
+        config          => $self->config,
+        extra_variables => { %extra_variables },
+    );
+}
+
 sub export_config {
     my $self = shift;
     
@@ -204,7 +247,9 @@ sub load_config_file {
     $Slic3r::GUI::Settings->{recent}{config_directory} = dirname($file);
     Slic3r::GUI->save_settings;
     $last_config = $file;
-    $_->load_external_config($file) for values %{$self->{options_tabs}};
+    for my $tab (values %{$self->{options_tabs}}) {
+        $tab->load_config_file($file);
+    }
 }
 
 sub load_config {
@@ -221,7 +266,11 @@ sub config_wizard {
 
     return unless $self->check_unsaved_changes;
     if (my $config = Slic3r::GUI::ConfigWizard->new($self)->run) {
-        $_->select_default_preset for values %{$self->{options_tabs}};
+        if ($self->{mode} eq 'expert') {
+            for my $tab (values %{$self->{options_tabs}}) {
+                $tab->select_default_preset;
+            }
+        }
         $self->load_config($config);
     }
 }
@@ -289,7 +338,7 @@ sub config {
     
     # retrieve filament presets and build a single config object for them
     my $filament_config;
-    if ($self->{plater}->filament_presets == 1) {
+    if (!$self->{plater} || $self->{plater}->filament_presets == 1 || $self->{mode} eq 'simple') {
         $filament_config = $self->{options_tabs}{filament}->config;
     } else {
         # TODO: handle dirty presets.
@@ -308,12 +357,21 @@ sub config {
         }
     }
     
-    return Slic3r::Config->merge(
+    my $config = Slic3r::Config->merge(
         Slic3r::Config->new_from_defaults,
         $self->{options_tabs}{print}->config,
         $self->{options_tabs}{printer}->config,
         $filament_config,
     );
+    
+    if ($self->{mode} eq 'simple') {
+        # set some sensible defaults
+        $config->set('first_layer_height', $config->nozzle_diameter->[0]);
+        $config->set('avoid_crossing_perimeters', 1);
+        $config->set('infill_every_layers', 10);
+    }
+    
+    return $config;
 }
 
 sub set_value {

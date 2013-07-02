@@ -7,7 +7,7 @@ A: Yes.
 ## What's it?
 
 Slic3r is a G-code generator for 3D printers. It's compatible with RepRaps,
-Makerbots, Ultimakers and many more machines.
+makerwares, Ultimakers and many more machines.
 
 See the [project homepage](http://slic3r.org/) at slic3r.org and the
 [documentation](https://github.com/alexrj/Slic3r/wiki/Documentation) on the Slic3r wiki for more information.
@@ -90,6 +90,10 @@ The author of the Silk icon set is Mark James.
         -o, --output <file> File to output gcode to (by default, the file will be saved
                             into the same directory as the input file using the 
                             --output-filename-format to generate the filename)
+      GUI options:
+        --no-plater         Disable the plater tab
+        --gui-mode          Overrides the configured mode (simple/expert)
+        --autosave <file>   Automatically export current configuration to the specified file
     
       Output options:
         --output-filename-format
@@ -108,7 +112,7 @@ The author of the Silk icon set is Mark James.
                             (default: 100,100)
         --z-offset          Additional height in mm to add to vertical coordinates
                             (+/-, default: 0)
-        --gcode-flavor      The type of G-code to generate (reprap/teacup/makerbot/mach3/no-extrusion,
+        --gcode-flavor      The type of G-code to generate (reprap/teacup/makerware/sailfish/mach3/no-extrusion,
                             default: reprap)
         --use-relative-e-distances Enable this to get relative E values
         --gcode-arcs        Use G2/G3 commands for native arcs (experimental, not supported
@@ -140,7 +144,7 @@ The author of the Silk icon set is Mark James.
                             (default: 30)
         --external-perimeter-speed
                             Speed of print moves for the external perimeter in mm/s or % over perimeter speed
-                            (default: 100%)
+                            (default: 70%)
         --infill-speed      Speed of print moves in mm/s (default: 60)
         --solid-infill-speed Speed of print moves for solid surfaces in mm/s or % over infill speed
                             (default: 60)
@@ -152,6 +156,20 @@ The author of the Silk icon set is Mark James.
         --gap-fill-speed    Speed of gap fill print moves in mm/s (default: 20)
         --first-layer-speed Speed of print moves for bottom layer, expressed either as an absolute
                             value or as a percentage over normal speeds (default: 30%)
+        
+      Acceleration options:
+        --perimeter-acceleration
+                            Overrides firmware's default acceleration for perimeters. (mm/s^2, set zero
+                            to disable; default: 0)
+        --infill-acceleration
+                            Overrides firmware's default acceleration for infill. (mm/s^2, set zero
+                            to disable; default: 0)
+        --bridge-acceleration
+                            Overrides firmware's default acceleration for bridges. (mm/s^2, set zero
+                            to disable; default: 0)
+        --default-acceleration
+                            Acceleration will be reset to this value after the specific settings above
+                            have been applied. (mm/s^2, set zero to disable; default: 130)
         
       Accuracy options:
         --layer-height      Layer height in mm (default: 0.4)
@@ -179,23 +197,39 @@ The author of the Silk icon set is Mark James.
         --toolchange-gcode  Load tool-change G-code from the supplied file (default: nothing).
         --extra-perimeters  Add more perimeters when needed (default: yes)
         --randomize-start   Randomize starting point across layers (default: yes)
+        --avoid-crossing-perimeters Optimize travel moves so that no perimeters are crossed (default: no)
+        --external-perimeters-first Reverse perimeter order. (default: no)
+        --spiral-vase       Experimental option to raise Z gradually when printing single-walled vases
+                            (default: no)
         --only-retract-when-crossing-perimeters
                             Disable retraction when travelling between infill paths inside the same island.
-                            (default: no)
+                            (default: yes)
         --solid-infill-below-area
                             Force solid infill when a region has a smaller area than this threshold
                             (mm^2, default: 70)
+        --infill-only-where-needed
+                            Only infill under ceilings (default: no)
+        --infill-first      Make infill before perimeters (default: no)
       
        Support material options:
         --support-material  Generate support material for overhangs
         --support-material-threshold
-                            Overhang threshold angle (range: 0-90, default: 45)
+                            Overhang threshold angle (range: 0-90, set 0 for automatic detection,
+                            default: 0)
         --support-material-pattern
                             Pattern to use for support material (default: rectilinear)
         --support-material-spacing
                             Spacing between pattern lines (mm, default: 2.5)
         --support-material-angle
                             Support material angle in degrees (range: 0-90, default: 0)
+        --support-material-interface-layers
+                            Number of perpendicular layers between support material and object (0+, default: 0)
+        --support-material-interface-spacing
+                            Spacing between interface pattern lines (mm, set 0 to get a solid layer, default: 0)
+        --raft-layers       Number of layers to raise the printed objects by (range: 0+, default: 0)
+        --support-material-enforce-layers
+                            Enforce support material on the specified number of layers from bottom,
+                            regardless of --support-material and threshold (0+, default: 0)
       
        Retraction options:
         --retract-length    Length of retraction in mm when pausing extrusion (default: 1)
@@ -206,6 +240,9 @@ The author of the Silk icon set is Mark James.
         --retract-before-travel
                             Only retract before travel moves of this length in mm (default: 2)
         --retract-lift      Lift Z by the given distance in mm when retracting (default: 0)
+        --retract-layer-change
+                            Enforce a retraction before each Z move (default: yes)
+        --wipe              Wipe the nozzle while doing a retraction (default: no)
         
        Retraction options for multi-extruder setups:
         --retract-length-toolchange
@@ -222,7 +259,7 @@ The author of the Silk icon set is Mark James.
         --fan-below-layer-time Enable fan if layer print time is below this approximate number 
                             of seconds (default: 60)
         --slowdown-below-layer-time Slow down if layer print time is below this approximate number
-                            of seconds (default: 15)
+                            of seconds (default: 30)
         --min-print-speed   Minimum print speed (mm/s, default: 10)
         --disable-fan-first-layers Disable fan for the first N layers (default: 1)
         --fan-always-on     Keep fan always on at min fan speed, even for layers that don't need
@@ -256,16 +293,21 @@ The author of the Silk icon set is Mark James.
        
        Miscellaneous options:
         --notes             Notes to be added as comments to the output file
+        --resolution        Minimum detail resolution (mm, set zero for full resolution, default: 0)
       
        Flow options (advanced):
         --extrusion-width   Set extrusion width manually; it accepts either an absolute value in mm
                             (like 0.65) or a percentage over layer height (like 200%)
         --first-layer-extrusion-width
                             Set a different extrusion width for first layer
-        --perimeters-extrusion-width
+        --perimeter-extrusion-width
                             Set a different extrusion width for perimeters
         --infill-extrusion-width
                             Set a different extrusion width for infill
+        --solid-infill-extrusion-width
+                            Set a different extrusion width for solid infill
+        --top-infill-extrusion-width
+                            Set a different extrusion width for top infill
         --support-material-extrusion-width
                             Set a different extrusion width for support material
         --bridge-flow-ratio Multiplier for extrusion when bridging (> 0, default: 1)
@@ -273,7 +315,7 @@ The author of the Silk icon set is Mark James.
        Multiple extruder options:
         --extruder-offset   Offset of each extruder, if firmware doesn't handle the displacement
                             (can be specified multiple times, default: 0x0)
-        --perimeters-extruder
+        --perimeter-extruder
                             Extruder to use for perimeters (1+, default: 1)
         --infill-extruder   Extruder to use for infill (1+, default: 1)
         --support-material-extruder

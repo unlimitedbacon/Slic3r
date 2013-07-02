@@ -6,9 +6,10 @@ use utf8;
 use List::Util qw(first);
 
 # cemetery of old config settings
-our @Ignore = qw(duplicate_x duplicate_y multiply_x multiply_y support_material_tool);
+our @Ignore = qw(duplicate_x duplicate_y multiply_x multiply_y support_material_tool acceleration);
 
 my $serialize_comma     = sub { join ',', @{$_[0]} };
+my $serialize_comma_bool = sub { join ',', map $_ // 0, @{$_[0]} };
 my $deserialize_comma   = sub { [ split /,/, $_[0] ] };
 
 our $Options = {
@@ -37,6 +38,15 @@ our $Options = {
         default => $Slic3r::have_threads ? 2 : 1,
         readonly => !$Slic3r::have_threads,
     },
+    'resolution' => {
+        label   => 'Resolution',
+        tooltip => 'Minimum detail resolution, used to simplify the input file for speeding up the slicing job and reducing memory usage. High-resolution models often carry more detail than printers can render. Set to zero to disable any simplification and use full resolution from input.',
+        sidetext => 'mm',
+        cli     => 'resolution=f',
+        type    => 'f',
+        min     => 0,
+        default => 0,
+    },
 
     # output options
     'output_filename_format' => {
@@ -64,8 +74,8 @@ our $Options = {
         tooltip => 'Some G/M-code commands, including temperature control and others, are not universal. Set this option to your printer\'s firmware to get a compatible output. The "No extrusion" flavor prevents Slic3r from exporting any extrusion value at all.',
         cli     => 'gcode-flavor=s',
         type    => 'select',
-        values  => [qw(reprap teacup makerbot mach3 no-extrusion)],
-        labels  => ['RepRap (Marlin/Sprinter)', 'Teacup', 'MakerBot', 'Mach3/EMC', 'No extrusion'],
+        values  => [qw(reprap teacup makerware sailfish mach3 no-extrusion)],
+        labels  => ['RepRap (Marlin/Sprinter/Repetier)', 'Teacup', 'MakerWare (MakerBot)', 'Sailfish (MakerBot)', 'Mach3/EMC', 'No extrusion'],
         default => 'reprap',
     },
     'use_relative_e_distances' => {
@@ -158,7 +168,7 @@ our $Options = {
         sidetext => '°C',
         cli     => 'temperature=i@',
         type    => 'i',
-        max     => 300,
+        max     => 400,
         serialize   => $serialize_comma,
         deserialize => sub { $_[0] ? [ split /,/, $_[0] ] : [0] },
         default => [200],
@@ -171,7 +181,7 @@ our $Options = {
         type    => 'i',
         serialize   => $serialize_comma,
         deserialize => sub { $_[0] ? [ split /,/, $_[0] ] : [0] },
-        max     => 300,
+        max     => 400,
         default => [200],
     },
     
@@ -254,7 +264,7 @@ our $Options = {
         cli     => 'external-perimeter-speed=s',
         type    => 'f',
         ratio_over => 'perimeter_speed',
-        default => '100%',
+        default => '70%',
     },
     'infill_speed' => {
         label   => 'Infill',
@@ -343,25 +353,37 @@ our $Options = {
     },
     
     # acceleration options
-    'acceleration' => {
-        label   => 'Enable acceleration control',
-        cli     => 'acceleration!',
-        type    => 'bool',
+    'default_acceleration' => {
+        label   => 'Default',
+        tooltip => 'This is the acceleration your printer will be reset to after the role-specific acceleration values are used (perimeter/infill). Set zero to prevent resetting acceleration at all.',
+        sidetext => 'mm/s²',
+        cli     => 'default-acceleration=f',
+        type    => 'f',
         default => 0,
     },
     'perimeter_acceleration' => {
         label   => 'Perimeters',
+        tooltip => 'This is the acceleration your printer will use for perimeters. A high value like 9000 usually gives good results if your hardware is up to the job. Set zero to disable acceleration control for perimeters.',
         sidetext => 'mm/s²',
-        cli     => 'perimeter-acceleration',
+        cli     => 'perimeter-acceleration=f',
         type    => 'f',
-        default => 25,
+        default => 0,
     },
     'infill_acceleration' => {
         label   => 'Infill',
+        tooltip => 'This is the acceleration your printer will use for infill. Set zero to disable acceleration control for infill.',
         sidetext => 'mm/s²',
-        cli     => 'infill-acceleration',
+        cli     => 'infill-acceleration=f',
         type    => 'f',
-        default => 50,
+        default => 0,
+    },
+    'bridge_acceleration' => {
+        label   => 'Bridge',
+        tooltip => 'This is the acceleration your printer will use for bridges. Set zero to disable acceleration control for bridges.',
+        sidetext => 'mm/s²',
+        cli     => 'bridge-acceleration=f',
+        type    => 'f',
+        default => 0,
     },
     
     # accuracy options
@@ -380,7 +402,7 @@ our $Options = {
         cli     => 'first-layer-height=s',
         type    => 'f',
         ratio_over => 'layer_height',
-        default => '100%',
+        default => 0.35,
     },
     'infill_every_layers' => {
         label   => 'Infill every',
@@ -398,6 +420,20 @@ our $Options = {
         cli     => 'solid-infill-every-layers=i',
         type    => 'i',
         min     => 0,
+        default => 0,
+    },
+    'infill_only_where_needed' => {
+        label   => 'Only infill where needed',
+        tooltip => 'This option will limit infill to the areas actually needed for supporting ceilings (it will act as internal support material).',
+        cli     => 'infill-only-where-needed!',
+        type    => 'bool',
+        default => 0,
+    },
+    'infill_first' => {
+        label   => 'Infill before perimeters',
+        tooltip => 'This option will switch the print order of perimeters and infill, making the latter first.',
+        cli     => 'infill-first!',
+        type    => 'bool',
         default => 0,
     },
     
@@ -432,6 +468,22 @@ our $Options = {
         tooltip => 'Set this to a non-zero value to set a manual extrusion width for infill. You may want to use fatter extrudates to speed up the infill and make your parts stronger. If expressed as percentage (for example 90%) if will be computed over layer height.',
         sidetext => 'mm or % (leave 0 for default)',
         cli     => 'infill-extrusion-width=s',
+        type    => 'f',
+        default => 0,
+    },
+    'solid_infill_extrusion_width' => {
+        label   => 'Solid infill',
+        tooltip => 'Set this to a non-zero value to set a manual extrusion width for infill for solid surfaces. If expressed as percentage (for example 90%) if will be computed over layer height.',
+        sidetext => 'mm or % (leave 0 for default)',
+        cli     => 'solid-infill-extrusion-width=s',
+        type    => 'f',
+        default => 0,
+    },
+    'top_infill_extrusion_width' => {
+        label   => 'Top solid infill',
+        tooltip => 'Set this to a non-zero value to set a manual extrusion width for infill for top surfaces. You may want to use thinner extrudates to fill all narrow regions and get a smoother finish. If expressed as percentage (for example 90%) if will be computed over layer height.',
+        sidetext => 'mm or % (leave 0 for default)',
+        cli     => 'top-infill-extrusion-width=s',
         type    => 'f',
         default => 0,
     },
@@ -496,7 +548,7 @@ our $Options = {
         type    => 'select',
         values  => [qw(rectilinear line concentric honeycomb hilbertcurve archimedeanchords octagramspiral)],
         labels  => [qw(rectilinear line concentric honeycomb), 'hilbertcurve (slow)', 'archimedeanchords (slow)', 'octagramspiral (slow)'],
-        default => 'rectilinear',
+        default => 'honeycomb',
     },
     'solid_fill_pattern' => {
         label   => 'Top/bottom fill pattern',
@@ -533,6 +585,7 @@ our $Options = {
     },
     'extra_perimeters' => {
         label   => 'Generate extra perimeters when needed',
+        tooltip => 'Add more perimeters when needed for avoiding gaps in sloping walls.',
         cli     => 'extra-perimeters!',
         type    => 'bool',
         default => 1,
@@ -542,14 +595,35 @@ our $Options = {
         tooltip => 'Start each layer from a different vertex to prevent plastic build-up on the same corner.',
         cli     => 'randomize-start!',
         type    => 'bool',
-        default => 1,
+        default => 0,
+    },
+    'avoid_crossing_perimeters' => {
+        label   => 'Avoid crossing perimeters',
+        tooltip => 'Optimize travel moves in order to minimize the crossing of perimeters. This is mostly useful with Bowden extruders which suffer from oozing. This feature slows down both the print and the G-code generation.',
+        cli     => 'avoid-crossing-perimeters!',
+        type    => 'bool',
+        default => 0,
+    },
+    'external_perimeters_first' => {
+        label   => 'External perimeters first',
+        tooltip => 'Print contour perimeters from the outermost one to the innermost one instead of the default inverse order.',
+        cli     => 'external-perimeters-first!',
+        type    => 'bool',
+        default => 0,
+    },
+    'spiral_vase' => {
+        label   => 'Spiral vase',
+        tooltip => 'This experimental feature will raise Z gradually while printing a single-walled object in order to remove any visible seam. By enabling this option other settings will be overridden to enforce a single perimeter, no infill, no top solid layers, no support material. You can still set any number of bottom solid layers as well as skirt/brim loops. It won\'t work when printing more than an object.',
+        cli     => 'spiral-vase!',
+        type    => 'bool',
+        default => 0,
     },
     'only_retract_when_crossing_perimeters' => {
         label   => 'Only retract when crossing perimeters',
-        tooltip => 'Disables retraction when travelling between infill paths inside the same island.',
+        tooltip => 'Disables retraction when the travel path does not exceed the upper layer\'s perimeters (and thus any ooze will be probably invisible).',
         cli     => 'only-retract-when-crossing-perimeters!',
         type    => 'bool',
-        default => 0,
+        default => 1,
     },
     'support_material' => {
         label   => 'Generate support material',
@@ -560,19 +634,19 @@ our $Options = {
     },
     'support_material_threshold' => {
         label   => 'Overhang threshold',
-        tooltip => 'Support material will not generated for overhangs whose slope angle is above the given threshold.',
+        tooltip => 'Support material will not generated for overhangs whose slope angle is above the given threshold. Set to zero for automatic detection.',
         sidetext => '°',
         cli     => 'support-material-threshold=i',
         type    => 'i',
-        default => 45,
+        default => 0,
     },
     'support_material_pattern' => {
         label   => 'Pattern',
         tooltip => 'Pattern used to generate support material.',
         cli     => 'support-material-pattern=s',
         type    => 'select',
-        values  => [qw(rectilinear honeycomb)],
-        labels  => [qw(rectilinear honeycomb)],
+        values  => [qw(rectilinear rectilinear-grid honeycomb)],
+        labels  => ['rectilinear', 'rectilinear grid', 'honeycomb'],
         default => 'rectilinear',
     },
     'support_material_spacing' => {
@@ -591,6 +665,38 @@ our $Options = {
         type    => 'i',
         default => 0,
     },
+    'support_material_interface_layers' => {
+        label   => 'Interface layers',
+        tooltip => 'Number of interface layers to insert between the object(s) and support material.',
+        sidetext => 'layers',
+        cli     => 'support-material-interface-layers=i',
+        type    => 'i',
+        default => 0,
+    },
+    'support_material_interface_spacing' => {
+        label   => 'Interface pattern spacing',
+        tooltip => 'Spacing between interface lines. Set zero to get a solid interface.',
+        sidetext => 'mm',
+        cli     => 'support-material-interface-spacing=f',
+        type    => 'f',
+        default => 0,
+    },
+    'support_material_enforce_layers' => {
+        label   => 'Enforce support for the first',
+        tooltip => 'Generate support material for the specified number of layers counting from bottom, regardless of whether normal support material is enabled or not and regardless of any angle threshold. This is useful for getting more adhesion of objects having a very thin or poor footprint on the build plate.',
+        sidetext => 'layers',
+        cli     => 'support-material-enforce-layers=f',
+        type    => 'i',
+        default => 0,
+    },
+    'raft_layers' => {
+        label   => 'Raft layers',
+        tooltip => 'Number of total raft layers to insert below the object(s).',
+        sidetext => 'layers',
+        cli     => 'raft-layers=i',
+        type    => 'i',
+        default => 0,
+    },
     'start_gcode' => {
         label   => 'Start G-code',
         tooltip => 'This start procedure is inserted at the beginning of the output file, right after the temperature control commands for extruder and bed. If Slic3r detects M104 or M190 in your custom codes, such commands will not be prepended automatically. Note that you can use placeholder variables for all Slic3r settings, so you can put a "M104 S[first_layer_temperature]" command wherever you want.',
@@ -601,7 +707,10 @@ our $Options = {
         height  => 120,
         serialize   => sub { join '\n', split /\R+/, $_[0] },
         deserialize => sub { join "\n", split /\\n/, $_[0] },
-        default => 'G28 ; home all axes',
+        default => <<'END',
+G28 ; home all axes
+G1 Z5 F5000 ; lift nozzle
+END
     },
     'end_gcode' => {
         label   => 'End G-code',
@@ -708,6 +817,24 @@ END
         deserialize => $deserialize_comma,
         default => [0],
     },
+    'retract_layer_change' => {
+        label   => 'Retract on layer change',
+        tooltip => 'This flag enforces a retraction whenever a Z move is done.',
+        cli     => 'retract-layer-change!',
+        type    => 'bool',
+        serialize   => $serialize_comma_bool,
+        deserialize => $deserialize_comma,
+        default => [1],
+    },
+    'wipe' => {
+        label   => 'Wipe before retract',
+        tooltip => 'This flag will move the nozzle while retracting to minimize the possible blob on leaky extruders.',
+        cli     => 'wipe!',
+        type    => 'bool',
+        serialize   => $serialize_comma_bool,
+        deserialize => $deserialize_comma,
+        default => [0],
+    },
     'retract_length_toolchange' => {
         label   => 'Length',
         tooltip => 'When retraction is triggered before changing tool, filament is pulled back by the specified amount (the length is measured on raw filament, before it enters the extruder).',
@@ -716,7 +843,7 @@ END
         type    => 'f',
         serialize   => $serialize_comma,
         deserialize => $deserialize_comma,
-        default => [3],
+        default => [10],
     },
     'retract_restart_extra_toolchange' => {
         label   => 'Extra length on restart',
@@ -731,11 +858,11 @@ END
     
     # cooling options
     'cooling' => {
-        label   => 'Enable cooling',
-        tooltip => 'This flag enables all the cooling features.',
+        label   => 'Enable auto cooling',
+        tooltip => 'This flag enables the automatic cooling logic that adjusts print speed and fan speed according to layer printing time.',
         cli     => 'cooling!',
         type    => 'bool',
-        default => 0,
+        default => 1,
     },
     'min_fan_speed' => {
         label   => 'Min',
@@ -743,7 +870,7 @@ END
         sidetext => '%',
         cli     => 'min-fan-speed=i',
         type    => 'i',
-        max     => 1000,
+        max     => 100,
         default => 35,
     },
     'max_fan_speed' => {
@@ -752,16 +879,16 @@ END
         sidetext => '%',
         cli     => 'max-fan-speed=i',
         type    => 'i',
-        max     => 1000,
+        max     => 100,
         default => 100,
     },
     'bridge_fan_speed' => {
         label   => 'Bridges fan speed',
-        tooltip => 'This fan speed is enforced during all bridges.',
+        tooltip => 'This fan speed is enforced during all bridges and overhangs.',
         sidetext => '%',
         cli     => 'bridge-fan-speed=i',
         type    => 'i',
-        max     => 1000,
+        max     => 100,
         default => 100,
     },
     'fan_below_layer_time' => {
@@ -782,7 +909,7 @@ END
         type    => 'i',
         max     => 1000,
         width   => 60,
-        default => 15,
+        default => 30,
     },
     'min_print_speed' => {
         label   => 'Min print speed',
@@ -929,7 +1056,11 @@ END
 };
 
 # generate accessors
-{
+if (eval "use Class::XSAccessor; 1") {
+    Class::XSAccessor->import(
+        getters => { map { $_ => $_ } keys %$Options },
+    );
+} else {
     no strict 'refs';
     for my $opt_key (keys %$Options) {
         *{$opt_key} = sub { $_[0]{$opt_key} };
@@ -964,18 +1095,18 @@ sub new_from_cli {
     for (qw(start end layer toolchange)) {
         my $opt_key = "${_}_gcode";
         if ($args{$opt_key}) {
-            die "Invalid value for --${_}-gcode: file does not exist\n"
-                if !-e $args{$opt_key};
-            open my $fh, "<", $args{$opt_key}
-                or die "Failed to open $args{$opt_key}\n";
-            binmode $fh, ':utf8';
-            $args{$opt_key} = do { local $/; <$fh> };
-            close $fh;
+            if (-e $args{$opt_key}) {
+                Slic3r::open(\my $fh, "<", $args{$opt_key})
+                    or die "Failed to open $args{$opt_key}\n";
+                binmode $fh, ':utf8';
+                $args{$opt_key} = do { local $/; <$fh> };
+                close $fh;
+            }
         }
     }
     
     $args{$_} = $Options->{$_}{deserialize}->($args{$_})
-        for grep exists $args{$_}, qw(print_center bed_size duplicate_grid extruder_offset);
+        for grep exists $args{$_}, qw(print_center bed_size duplicate_grid extruder_offset retract_layer_change wipe);
     
     return $class->new(%args);
 }
@@ -1034,7 +1165,7 @@ sub set {
     my ($opt_key, $value, $deserialize) = @_;
     
     # handle legacy options
-    return if $opt_key ~~ @Ignore;
+    return if first { $_ eq $opt_key } @Ignore;
     if ($opt_key =~ /^(extrusion_width|bottom_layer_speed|first_layer_height)_ratio$/) {
         $opt_key = $1;
         $opt_key =~ s/^bottom_layer_speed$/first_layer_speed/;
@@ -1042,6 +1173,20 @@ sub set {
     }
     if ($opt_key eq 'threads' && !$Slic3r::have_threads) {
         $value = 1;
+    }
+    if ($opt_key eq 'gcode_flavor' && $value eq 'makerbot') {
+        $value = 'makerware';
+    }
+    
+    # For historical reasons, the world's full of configs having these very low values;
+    # to avoid unexpected behavior we need to ignore them.  Banning these two hard-coded
+    # values is a dirty hack and will need to be removed sometime in the future, but it
+    # will avoid lots of complaints for now.
+    if ($opt_key eq 'perimeter_acceleration' && $value == '25') {
+        $value = 0;
+    }
+    if ($opt_key eq 'infill_acceleration' && $value == '50') {
+        $value = 0;
     }
     
     if (!exists $Options->{$opt_key}) {
@@ -1153,6 +1298,10 @@ sub validate {
     die "Invalid value for --top-solid-layers\n"    if $self->top_solid_layers      < 0;
     die "Invalid value for --bottom-solid-layers\n" if $self->bottom_solid_layers   < 0;
     
+    # --gcode-flavor
+    die "Invalid value for --gcode-flavor\n"
+        if !first { $_ eq $self->gcode_flavor } @{$Options->{gcode_flavor}{values}};
+    
     # --print-center
     die "Invalid value for --print-center\n"
         if !ref $self->print_center 
@@ -1176,9 +1325,6 @@ sub validate {
     # --infill-every-layers
     die "Invalid value for --infill-every-layers\n"
         if $self->infill_every_layers !~ /^\d+$/ || $self->infill_every_layers < 1;
-    # TODO: this check should be limited to the extruder used for infill
-    die "Maximum infill thickness can't exceed nozzle diameter\n"
-        if grep $self->infill_every_layers * $self->layer_height > $_, @{$self->nozzle_diameter};
     
     # --scale
     die "Invalid value for --scale\n"
@@ -1214,6 +1360,37 @@ sub validate {
         if $self->extruder_clearance_radius <= 0;
     die "Invalid value for --extruder-clearance-height\n"
         if $self->extruder_clearance_height <= 0;
+    
+    # --extrusion-multiplier
+    die "Invalid value for --extrusion-multiplier\n"
+        if defined first { $_ <= 0 } @{$self->extrusion_multiplier};
+    
+    # general validation, quick and dirty
+    foreach my $opt_key (keys %$Options) {
+        my $opt = $Options->{$opt_key};
+        next unless defined $self->$opt_key;
+        next unless defined $opt->{cli} && $opt->{cli} =~ /=(.+)$/;
+        my $type = $1;
+        my @values = ();
+        if ($type =~ s/\@$//) {
+            die "Invalid value for $opt_key\n" if ref($self->$opt_key) ne 'ARRAY';
+            @values = @{ $self->$opt_key };
+        } else {
+            @values = ($self->$opt_key);
+        }
+        foreach my $value (@values) {
+            if ($type eq 'i' || $type eq 'f') {
+                die "Invalid value for $opt_key\n"
+                    if ($type eq 'i' && $value !~ /^\d+$/)
+                    || ($type eq 'f' && $value !~ /^(?:\d+|\d*\.\d+)$/)
+                    || (defined $opt->{min} && $value < $opt->{min})
+                    || (defined $opt->{max} && $value > $opt->{max});
+            } elsif ($type eq 's' && $opt->{type} eq 'select') {
+                die "Invalid value for $opt_key\n"
+                    unless first { $_ eq $value } @{ $opt->{values} };
+            }
+        }
+    }
 }
 
 sub replace_options {
@@ -1271,7 +1448,7 @@ sub write_ini {
     my $class = shift;
     my ($file, $ini) = @_;
     
-    open my $fh, '>', $file;
+    Slic3r::open(\my $fh, '>', $file);
     binmode $fh, ':utf8';
     my $localtime = localtime;
     printf $fh "# generated by Slic3r $Slic3r::VERSION on %s\n", "$localtime";
@@ -1289,12 +1466,12 @@ sub read_ini {
     my ($file) = @_;
     
     local $/ = "\n";
-    open my $fh, '<', $file;
+    Slic3r::open(\my $fh, '<', $file);
     binmode $fh, ':utf8';
     
     my $ini = { _ => {} };
     my $category = '_';
-    while (my $_ = <$fh>) {
+    while (<$fh>) {
         s/\R+$//;
         next if /^\s+/;
         next if /^$/;

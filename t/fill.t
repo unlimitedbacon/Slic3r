@@ -2,7 +2,7 @@ use Test::More;
 use strict;
 use warnings;
 
-plan tests => 8;
+plan tests => 10;
 
 BEGIN {
     use FindBin;
@@ -12,13 +12,17 @@ BEGIN {
 use Slic3r;
 use Slic3r::Geometry qw(scale X Y);
 use Slic3r::Surface qw(:types);
+use Slic3r::Test;
 
 sub scale_points (@) { map [scale $_->[X], scale $_->[Y]], @_ }
 
 {
     my $print = Slic3r::Print->new;
     $print->init_extruders;
-    my $filler = Slic3r::Fill::Rectilinear->new(print => $print);
+    my $filler = Slic3r::Fill::Rectilinear->new(
+        print           => $print,
+        bounding_box    => Slic3r::Geometry::BoundingBox->new_from_points([ [0, 0], [10, 10] ]),
+    );
     my $surface_width = 250;
     my $distance = $filler->adjust_solid_spacing(
         width       => $surface_width,
@@ -29,10 +33,13 @@ sub scale_points (@) { map [scale $_->[X], scale $_->[Y]], @_ }
 }
 
 {
-    my $filler = Slic3r::Fill::Rectilinear->new;
+    my $expolygon = Slic3r::ExPolygon->new([ scale_points [0,0], [50,0], [50,50], [0,50] ]);
+    my $filler = Slic3r::Fill::Rectilinear->new(
+        bounding_box => $expolygon->bounding_box,
+    );
     my $surface = Slic3r::Surface->new(
         surface_type    => S_TYPE_TOP,
-        expolygon       => Slic3r::ExPolygon->new([ scale_points [0,0], [50,0], [50,50], [0,50] ]),
+        expolygon       => $expolygon,
     );
     foreach my $angle (0, 45) {
         $surface->expolygon->rotate(Slic3r::Geometry::deg2rad($angle), [0,0]);
@@ -47,9 +54,9 @@ sub scale_points (@) { map [scale $_->[X], scale $_->[Y]], @_ }
         Slic3r::Polyline->new([0,10], [0,8], [0,5]),
     ]);
     is_deeply
-        [ map $_->[Y], map @$_, $collection->shortest_path(Slic3r::Point->new(0,30)) ],
+        [ map $_->[Y], map @$_, $collection->chained_path(Slic3r::Point->new(0,30)) ],
         [20, 18, 15, 10, 8, 5],
-        'shortest path';
+        'chained path';
 }
 
 {
@@ -58,9 +65,9 @@ sub scale_points (@) { map [scale $_->[X], scale $_->[Y]], @_ }
         Slic3r::Polyline->new([10,5], [15,5], [20,5]),
     ]);
     is_deeply
-        [ map $_->[X], map @$_, $collection->shortest_path(Slic3r::Point->new(30,0)) ],
+        [ map $_->[X], map @$_, $collection->chained_path(Slic3r::Point->new(30,0)) ],
         [reverse 4, 10, 15, 10, 15, 20],
-        'shortest path';
+        'chained path';
 }
 
 {
@@ -70,9 +77,9 @@ sub scale_points (@) { map [scale $_->[X], scale $_->[Y]], @_ }
             Slic3r::Polyline->new([0,10], [0,8], [0,5]),
     ]);
     is_deeply
-        [ map $_->[Y], map @{$_->unpack->polyline}, $collection->shortest_path(Slic3r::Point->new(0,30)) ],
+        [ map $_->[Y], map @{$_->unpack->polyline}, $collection->chained_path(Slic3r::Point->new(0,30)) ],
         [20, 18, 15, 10, 8, 5],
-        'shortest path';
+        'chained path';
 }
 
 {
@@ -82,9 +89,37 @@ sub scale_points (@) { map [scale $_->[X], scale $_->[Y]], @_ }
             Slic3r::Polyline->new([10,5], [15,5], [20,5]),
     ]);
     is_deeply
-        [ map $_->[X], map @{$_->unpack->polyline}, $collection->shortest_path(Slic3r::Point->new(30,0)) ],
+        [ map $_->[X], map @{$_->unpack->polyline}, $collection->chained_path(Slic3r::Point->new(30,0)) ],
         [reverse 4, 10, 15, 10, 15, 20],
-        'shortest path';
+        'chained path';
+}
+
+{
+    my $config = Slic3r::Config->new_from_defaults;
+    $config->set('fill_pattern', 'hilbertcurve');
+    my $print = Slic3r::Test::init_print('20mm_cube', config => $config);
+    ok Slic3r::Test::gcode($print), 'successful hilbertcurve infill generation';
+}
+
+{
+    my $config = Slic3r::Config->new_from_defaults;
+    $config->set('skirts', 0);
+    $config->set('perimeters', 0);
+    $config->set('fill_density', 0);
+    $config->set('top_solid_layers', 0);
+    $config->set('bottom_solid_layers', 0);
+    $config->set('solid_infill_below_area', 20000000);
+    $config->set('solid_infill_every_layers', 2);
+    
+    my $print = Slic3r::Test::init_print('20mm_cube', config => $config);
+    my %layers_with_extrusion = ();
+    Slic3r::GCode::Reader->new(gcode => Slic3r::Test::gcode($print))->parse(sub {
+        my ($self, $cmd, $args, $info) = @_;
+        $layers_with_extrusion{$self->Z} = 1 if $info->{extruding};
+    });
+    
+    ok !%layers_with_extrusion,
+        "solid_infill_below_area and solid_infill_every_layers are ignored when fill_density is 0";
 }
 
 __END__

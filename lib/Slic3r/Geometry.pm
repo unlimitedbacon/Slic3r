@@ -7,17 +7,18 @@ our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(
     PI X Y Z A B X1 Y1 X2 Y2 MIN MAX epsilon slope line_atan lines_parallel 
     line_point_belongs_to_segment points_coincide distance_between_points 
+    chained_path_items chained_path_points normalize tan move_points_3D
     line_length midpoint point_in_polygon point_in_segment segment_in_segment
     point_is_on_left_of_segment polyline_lines polygon_lines nearest_point
     point_along_segment polygon_segment_having_point polygon_has_subsegment
     polygon_has_vertex polyline_length can_connect_points deg2rad rad2deg
-    rotate_points move_points remove_coinciding_points clip_segment_polygon
+    rotate_points move_points clip_segment_polygon nearest_point_index
     sum_vectors multiply_vector subtract_vectors dot perp polygon_points_visibility
     line_intersection bounding_box bounding_box_intersect same_point same_line
     longest_segment angle3points three_points_aligned line_direction
     polyline_remove_parallel_continuous_edges polyline_remove_acute_vertices
     polygon_remove_acute_vertices polygon_remove_parallel_continuous_edges
-    shortest_path collinear scale unscale merge_collinear_lines
+    chained_path collinear scale unscale merge_collinear_lines
     rad2deg_dir bounding_box_center line_intersects_any douglas_peucker
     polyline_remove_short_segments normal triangle_normal polygon_is_convex
     scaled_epsilon bounding_box_3D size_3D size_2D
@@ -43,6 +44,11 @@ sub scaled_epsilon () { epsilon / &Slic3r::SCALING_FACTOR }
 
 sub scale   ($) { $_[0] / &Slic3r::SCALING_FACTOR }
 sub unscale ($) { $_[0] * &Slic3r::SCALING_FACTOR }
+
+sub tan {
+    my ($angle) = @_;
+    return (sin $angle) / (cos $angle);
+}
 
 sub slope {
     my ($line) = @_;
@@ -223,15 +229,7 @@ sub point_is_on_left_of_segment {
 
 sub polyline_lines {
     my ($polygon) = @_;
-    
-    my @lines = ();
-    my $last_point;
-    foreach my $point (@$polygon) {
-        push @lines, Slic3r::Line->new($last_point, $point) if $last_point;
-        $last_point = $point;
-    }
-    
-    return @lines;
+    return map Slic3r::Line->new($polygon->[$_], $polygon->[$_+1]), 0 .. $#$polygon-1;
 }
 
 sub polygon_lines {
@@ -250,14 +248,27 @@ sub nearest_point_index {
     my ($point, $points) = @_;
     
     my ($nearest_point_index, $distance) = ();
+
+    my $point_x = $point->[X];
+    my $point_y = $point->[Y];
+
     for my $i (0..$#$points) {
-        my $d = distance_between_points($point, $points->[$i]);
-        if (!defined $distance || $d < $distance) {
-            $nearest_point_index = $i;
-            $distance = $d;
-            return $i if $distance < epsilon;
-        }
+        my $d = ($point_x - $points->[$i]->[X])**2;
+        # If the X distance of the candidate is > than the total distance of the
+        # best previous candidate, we know we don't want it
+        next if (defined $distance && $d > $distance);
+   
+        # If the total distance of the candidate is > than the total distance of the
+        # best previous candidate, we know we don't want it
+        $d += ($point_y - $points->[$i]->[Y])**2;
+        next if (defined $distance && $d > $distance);
+
+        $nearest_point_index = $i;
+        $distance = $d;
+        
+        last if $distance < epsilon;
     }
+
     return $nearest_point_index;
 }
 
@@ -377,13 +388,13 @@ sub move_points {
     return map Slic3r::Point->new($shift->[X] + $_->[X], $shift->[Y] + $_->[Y]), @points;
 }
 
-# preserves order
-sub remove_coinciding_points {
-    my ($points) = @_;
-    
-    my %p = map { sprintf('%f,%f', @$_) => "$_" } @$points;
-    %p = reverse %p;
-    @$points = grep $p{"$_"}, @$points;
+sub move_points_3D {
+    my ($shift, @points) = @_;
+    return map [
+        $shift->[X] + $_->[X],
+        $shift->[Y] + $_->[Y],
+        $shift->[Z] + $_->[Z],
+    ], @points;
 }
 
 # implementation of Liang-Barsky algorithm
@@ -462,6 +473,14 @@ sub triangle_normal {
     my $v = [ map +($v3->[$_] - $v1->[$_]), (X,Y,Z) ];
     
     return normal($u, $v);
+}
+
+sub normalize {
+    my ($line) = @_;
+    
+    my $len = sqrt( ($line->[X]**2) + ($line->[Y]**2) + ($line->[Z]**2) )
+        or return [0, 0, 0];  # to avoid illegal division by zero
+    return [ map $_ / $len, @$line ];
 }
 
 # 2D dot product
@@ -682,10 +701,10 @@ sub bounding_box {
 }
 
 sub bounding_box_center {
-    my @bounding_box = bounding_box(@_);
+    my ($bounding_box) = @_;
     return Slic3r::Point->new(
-        ($bounding_box[X2] + $bounding_box[X1]) / 2,
-        ($bounding_box[Y2] + $bounding_box[Y1]) / 2,
+        ($bounding_box->[X2] + $bounding_box->[X1]) / 2,
+        ($bounding_box->[Y2] + $bounding_box->[Y1]) / 2,
     );
 }
 
@@ -793,29 +812,43 @@ sub polyline_remove_short_segments {
     }
 }
 
-# accepts an arrayref; each item should be an arrayref whose first
-# item is the point to be used for the shortest path, and the second
-# one is the value to be returned in output (if the second item
-# is not provided, the point will be returned)
-sub shortest_path {
+# accepts an arrayref of points; it returns a list of indices
+# according to a nearest-neighbor walk
+sub chained_path {
     my ($items, $start_near) = @_;
     
-    my %values = map +($_->[0] => $_->[1] || $_->[0]), @$items;
-    my @points = map $_->[0], @$items;
+    my @points = @$items;
+    my %indices = map { $points[$_] => $_ } 0 .. $#points;
     
-    my $result = [];
+    my @result = ();
     my $last_point;
     if (!$start_near) {
         $start_near = shift @points;
-        push @$result, $values{$start_near} if $start_near;
+        push @result, $indices{$start_near} if $start_near;
     }
     while (@points) {
         $start_near = nearest_point($start_near, [@points]);
         @points = grep $_ ne $start_near, @points;
-        push @$result, $values{$start_near};
+        push @result, $indices{$start_near};
     }
     
-    return $result;
+    return @result;
+}
+
+# accepts an arrayref; each item should be an arrayref whose first
+# item is the point to be used for the shortest path, and the second
+# one is the value to be returned in output (if the second item
+# is not provided, the point will be returned)
+sub chained_path_items {
+    my ($items, $start_near) = @_;
+    
+    my @indices = chained_path([ map $_->[0], @$items ], $start_near);
+    return [ map $_->[1], @$items[@indices] ];
+}
+
+sub chained_path_points {
+    my ($points, $start_near) = @_;
+    return [ @$points[ chained_path($points, $start_near) ] ];
 }
 
 sub douglas_peucker {

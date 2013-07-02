@@ -5,8 +5,9 @@ use warnings;
 # an ExPolygon is a polygon with holes
 
 use Boost::Geometry::Utils;
+use List::Util qw(first);
 use Math::Geometry::Voronoi;
-use Slic3r::Geometry qw(X Y A B point_in_polygon same_line line_length);
+use Slic3r::Geometry qw(X Y A B point_in_polygon same_line epsilon);
 use Slic3r::Geometry::Clipper qw(union_ex JT_MITER);
 
 # the constructor accepts an array of polygons 
@@ -54,9 +55,28 @@ sub clipper_expolygon {
     };
 }
 
-sub boost_polygon {
+sub is_valid {
     my $self = shift;
-    return Boost::Geometry::Utils::polygon(@$self);
+    return (!first { !$_->is_valid } @$self)
+        && $self->contour->is_counter_clockwise
+        && (!first { $_->is_counter_clockwise } $self->holes);
+}
+
+# returns false if the expolygon is too tight to be printed
+sub is_printable {
+    my $self = shift;
+    my ($width) = @_;
+    
+    # try to get an inwards offset
+    # for a distance equal to half of the extrusion width;
+    # if no offset is possible, then expolygon is not printable.
+    return Slic3r::Geometry::Clipper::offset($self, -$width / 2) ? 1 : 0;
+}
+
+sub wkt {
+    my $self = shift;
+    return sprintf "POLYGON(%s)", 
+        join ',', map "($_)", map { join ',', map "$_->[0] $_->[1]", @$_ } @$self;
 }
 
 sub offset {
@@ -71,15 +91,7 @@ sub offset_ex {
 
 sub safety_offset {
     my $self = shift;
-    
-    # we're offsetting contour and holes separately
-    # because Clipper doesn't return polygons in the same order as 
-    # we feed them to it
-    
-    return (ref $self)->new(
-        $self->contour->safety_offset,
-        @{ Slic3r::Geometry::Clipper::safety_offset([$self->holes]) },
-    );
+    return Slic3r::Geometry::Clipper::safety_offset_ex($self, @_);
 }
 
 sub noncollapsing_offset_ex {
@@ -92,18 +104,16 @@ sub noncollapsing_offset_ex {
 sub encloses_point {
     my $self = shift;
     my ($point) = @_;
-    return $self->contour->encloses_point($point)
-        && (!grep($_->encloses_point($point), $self->holes)
-            || grep($_->point_on_segment($point), $self->holes));
+    return Boost::Geometry::Utils::point_covered_by_polygon($point, $self);
 }
 
 # A version of encloses_point for use when hole borders do not matter.
-# Useful because point_on_segment is slow
+# Useful because point_on_segment is probably slower (this was true
+# before the switch to Boost.Geometry, not sure about now)
 sub encloses_point_quick {
     my $self = shift;
     my ($point) = @_;
-    return $self->contour->encloses_point($point)
-        && !grep($_->encloses_point($point), $self->holes);
+    return Boost::Geometry::Utils::point_within_polygon($point, $self);
 }
 
 sub encloses_line {
@@ -114,54 +124,31 @@ sub encloses_line {
         # optimization
         return @$clip == 1 && same_line($clip->[0], $line);
     } else {
-        return @$clip == 1 && abs(line_length($clip->[0]) - $line->length) < $tolerance;
+        return @$clip == 1 && abs(Boost::Geometry::Utils::linestring_length($clip->[0]) - $line->length) < $tolerance;
     }
-}
-
-sub point_on_segment {
-    my $self = shift;
-    my ($point) = @_;
-    for (@$self) {
-        my $line = $_->point_on_segment($point);
-        return $line if $line;
-    }
-    return undef;
 }
 
 sub bounding_box {
     my $self = shift;
-    return Slic3r::Geometry::bounding_box($self->contour);
-}
-
-sub bounding_box_polygon {
-    my $self = shift;
-    my @bb = $self->bounding_box;
-    return Slic3r::Polygon->new([
-        [ $bb[0], $bb[1] ],
-        [ $bb[2], $bb[1] ],
-        [ $bb[2], $bb[3] ],
-        [ $bb[0], $bb[3] ],
-    ]);
-}
-
-sub bounding_box_center {
-    my $self = shift;
-    return Slic3r::Geometry::bounding_box_center($self->contour);
+    return $self->contour->bounding_box;
 }
 
 sub clip_line {
     my $self = shift;
     my ($line) = @_;  # line must be a Slic3r::Line object
     
-    return Boost::Geometry::Utils::polygon_linestring_intersection(
-        $self->boost_polygon,
-        $line->boost_linestring,
-    );
+    return Boost::Geometry::Utils::polygon_multi_linestring_intersection($self, [$line]);
 }
 
 sub simplify {
     my $self = shift;
-    $_->simplify(@_) for @$self;
+    my ($tolerance) = @_;
+    
+    # it would be nice to have a multilinestring_simplify method in B::G::U
+    my @simplified = Slic3r::Geometry::Clipper::simplify_polygons(
+        [ map Boost::Geometry::Utils::linestring_simplify($_, $tolerance), @$self ],
+    );
+    return @{ Slic3r::Geometry::Clipper::union_ex([ @simplified ]) };
 }
 
 sub scale {
@@ -172,11 +159,13 @@ sub scale {
 sub translate {
     my $self = shift;
     $_->translate(@_) for @$self;
+    $self;
 }
 
 sub rotate {
     my $self = shift;
     $_->rotate(@_) for @$self;
+    $self;
 }
 
 sub area {
@@ -323,11 +312,25 @@ sub align_to_origin {
     
     my @bb = Slic3r::Geometry::bounding_box([ map @$_, map @$_, @{$self->expolygons} ]);
     $_->translate(-$bb[X1], -$bb[Y1]) for @{$self->expolygons};
+    $self;
+}
+
+sub scale {
+    my $self = shift;
+    $_->scale(@_) for @{$self->expolygons};
+    $self;
 }
 
 sub rotate {
     my $self = shift;
     $_->rotate(@_) for @{$self->expolygons};
+    $self;
+}
+
+sub translate {
+    my $self = shift;
+    $_->translate(@_) for @{$self->expolygons};
+    $self;
 }
 
 sub size {

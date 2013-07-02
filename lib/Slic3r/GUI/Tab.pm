@@ -14,7 +14,7 @@ sub new {
     my ($parent, %params) = @_;
     my $self = $class->SUPER::new($parent, -1, wxDefaultPosition, wxDefaultSize, wxBK_LEFT | wxTAB_TRAVERSAL);
     $self->{options} = []; # array of option names handled by this tab
-    $self->{$_} = $params{$_} for qw(plater on_value_change);
+    $self->{$_} = $params{$_} for qw(on_value_change on_presets_changed);
     
     # horizontal sizer
     $self->{sizer} = Wx::BoxSizer->new(wxHORIZONTAL);
@@ -81,7 +81,7 @@ sub new {
     
     EVT_CHOICE($parent, $self->{presets_choice}, sub {
         $self->on_select_preset;
-        $self->sync_presets;
+        $self->on_presets_changed;
     });
     
     EVT_BUTTON($self, $self->{btn_save_preset}, sub {
@@ -108,7 +108,7 @@ sub new {
         $self->load_presets;
         $self->{presets_choice}->SetSelection(first { basename($self->{presets}[$_]{file}) eq $dlg->get_name . ".ini" } 1 .. $#{$self->{presets}});
         $self->on_select_preset;
-        $self->sync_presets;
+        $self->on_presets_changed;
     });
     
     EVT_BUTTON($self, $self->{btn_delete_preset}, sub {
@@ -124,7 +124,7 @@ sub new {
         $self->{presets_choice}->Delete($i);
         $self->{presets_choice}->SetSelection(0);
         $self->on_select_preset;
-        $self->sync_presets;
+        $self->on_presets_changed;
     });
     
     $self->{config} = Slic3r::Config->new;
@@ -152,6 +152,12 @@ sub get_preset {
 sub on_value_change {
     my $self = shift;
     $self->{on_value_change}->(@_) if $self->{on_value_change};
+}
+
+sub on_presets_changed {
+    my $self = shift;
+    $self->{on_presets_changed}->([$self->{presets_choice}->GetStrings], $self->{presets_choice}->GetSelection)
+        if $self->{on_presets_changed};
 }
 
 sub on_preset_loaded {}
@@ -191,16 +197,21 @@ sub on_select_preset {
             $self->{config}->set($opt_key, $preset_config->get($opt_key))
                 if $preset_config->has($opt_key);
         }
+        ($preset->{default} || $preset->{external})
+            ? $self->{btn_delete_preset}->Disable
+            : $self->{btn_delete_preset}->Enable;
+        
+        $self->on_preset_loaded;
+        $self->reload_values;
+        $self->set_dirty(0);
+        $Slic3r::GUI::Settings->{presets}{$self->name} = $preset->{file} ? basename($preset->{file}) : '';
     };
-    Slic3r::GUI::catch_error($self);
-    ($preset->{default} || $preset->{external})
-        ? $self->{btn_delete_preset}->Disable
-        : $self->{btn_delete_preset}->Enable;
+    if ($@) {
+        $@ = "I was unable to load the selected config file: $@";
+        Slic3r::GUI::catch_error($self);
+        $self->select_default_preset;
+    }
     
-    $self->on_preset_loaded;
-    $self->reload_values;
-    $self->set_dirty(0);
-    $Slic3r::GUI::Settings->{presets}{$self->name} = $preset->{file} ? basename($preset->{file}) : '';
     Slic3r::GUI->save_settings;
 }
 
@@ -216,7 +227,7 @@ sub get_preset_config {
             return;
         }
         
-        # apply preset values on top of defaults
+        # apply preset values on top of defaults
         my $external_config = Slic3r::Config->load($preset->{file});
         my $config = Slic3r::Config->new;
         $config->set($_, $external_config->get($_))
@@ -252,7 +263,7 @@ sub add_options_page {
     my $page = Slic3r::GUI::Tab::Page->new($self, $title, $self->{iconcount}, %params, on_change => sub {
         $self->on_value_change(@_);
         $self->set_dirty(1);
-        $self->sync_presets;
+        $self->on_presets_changed;
     });
     $page->Hide;
     $self->{sizer}->Add($page, 1, wxEXPAND | wxLEFT, 5);
@@ -312,7 +323,7 @@ sub set_dirty {
         $self->{presets_choice}->SetString($i, $text);
         $self->{presets_choice}->SetSelection($selection);  # http://trac.wxwidgets.org/ticket/13769
     }
-    $self->sync_presets;
+    $self->on_presets_changed;
 }
 
 sub is_dirty {
@@ -347,10 +358,10 @@ sub load_presets {
         $self->{presets_choice}->SetSelection($i || 0);
         $self->on_select_preset;
     }
-    $self->sync_presets;
+    $self->on_presets_changed;
 }
 
-sub load_external_config {
+sub load_config_file {
     my $self = shift;
     my ($file) = @_;
     
@@ -368,12 +379,7 @@ sub load_external_config {
     }
     $self->{presets_choice}->SetSelection($i);
     $self->on_select_preset;
-    $self->sync_presets;
-}
-
-sub sync_presets {
-    my $self = shift;
-    $self->{plater}->update_presets($self->name, [$self->{presets_choice}->GetStrings], $self->{presets_choice}->GetSelection);
+    $self->on_presets_changed;
 }
 
 package Slic3r::GUI::Tab::Print;
@@ -404,6 +410,10 @@ sub build {
                 },
             ],
         },
+        {
+            title => 'Advanced',
+            options => [qw(avoid_crossing_perimeters external_perimeters_first spiral_vase)],
+        },
     ]);
     
     $self->add_options_page('Infill', 'shading.png', optgroups => [
@@ -413,7 +423,8 @@ sub build {
         },
         {
             title => 'Advanced',
-            options => [qw(infill_every_layers solid_infill_every_layers fill_angle solid_infill_below_area only_retract_when_crossing_perimeters)],
+            options => [qw(infill_every_layers infill_only_where_needed solid_infill_every_layers fill_angle
+                solid_infill_below_area only_retract_when_crossing_perimeters infill_first)],
         },
     ]);
     
@@ -431,8 +442,12 @@ sub build {
             options => [qw(first_layer_speed)],
         },
         {
+            title => 'Acceleration control (advanced)',
+            options => [qw(perimeter_acceleration infill_acceleration bridge_acceleration default_acceleration)],
+	},
+	{
             title => 'Speed Limits',
-	        options => [qw(x_limit_speed y_limit_speed z_limit_speed)],
+	    options => [qw(x_limit_speed y_limit_speed z_limit_speed)],
         },
     ]);
     
@@ -450,7 +465,16 @@ sub build {
     $self->add_options_page('Support material', 'building.png', optgroups => [
         {
             title => 'Support material',
-            options => [qw(support_material support_material_threshold support_material_pattern support_material_spacing support_material_angle)],
+            options => [qw(support_material support_material_threshold support_material_enforce_layers)],
+        },
+        {
+            title => 'Raft',
+            options => [qw(raft_layers)],
+        },
+        {
+            title => 'Options for support material and raft',
+            options => [qw(support_material_pattern support_material_spacing support_material_angle
+                support_material_interface_layers support_material_interface_spacing)],
         },
     ]);
     
@@ -496,16 +520,16 @@ sub build {
         {
             title => 'Extrusion width',
             label_width => 180,
-            options => [qw(extrusion_width first_layer_extrusion_width perimeter_extrusion_width infill_extrusion_width support_material_extrusion_width)],
+            options => [qw(extrusion_width first_layer_extrusion_width perimeter_extrusion_width infill_extrusion_width solid_infill_extrusion_width top_infill_extrusion_width support_material_extrusion_width)],
         },
         {
             title => 'Flow',
             options => [qw(bridge_flow_ratio)],
         },
-        $Slic3r::have_threads ? {
+        {
             title => 'Other',
-            options => [qw(threads)],
-        } : (),
+            options => [($Slic3r::have_threads ? qw(threads) : ()), qw(resolution)],
+        },
     ]);
 }
 
@@ -544,8 +568,9 @@ sub build {
     $self->add_options_page('Cooling', 'hourglass.png', optgroups => [
         {
             title => 'Enable',
-            options => [qw(cooling)],
+            options => [qw(fan_always_on cooling)],
             lines => [
+                Slic3r::GUI::OptionsGroup->single_option_line('fan_always_on'),
                 Slic3r::GUI::OptionsGroup->single_option_line('cooling'),
                 {
                     label => '',
@@ -555,7 +580,7 @@ sub build {
         },
         {
             title => 'Fan settings',
-            options => [qw(min_fan_speed max_fan_speed bridge_fan_speed disable_fan_first_layers fan_always_on)],
+            options => [qw(min_fan_speed max_fan_speed bridge_fan_speed disable_fan_first_layers)],
             lines => [
                 {
                     label   => 'Fan speed',
@@ -563,7 +588,6 @@ sub build {
                 },
                 Slic3r::GUI::OptionsGroup->single_option_line('bridge_fan_speed'),
                 Slic3r::GUI::OptionsGroup->single_option_line('disable_fan_first_layers'),
-                Slic3r::GUI::OptionsGroup->single_option_line('fan_always_on'),
             ],
         },
         {
@@ -580,6 +604,15 @@ sub _update_description {
     my $config = $self->config;
     
     my $msg = "";
+    my $fan_other_layers = $config->fan_always_on
+        ? sprintf "will always run at %d%%%s.", $config->min_fan_speed,
+                ($config->disable_fan_first_layers > 1
+                    ? " except for the first " . $config->disable_fan_first_layers . " layers"
+                    : $config->disable_fan_first_layers == 1
+                        ? " except for the first layer"
+                        : "")
+        : "will be turned off.";
+    
     if ($config->cooling) {
         $msg = sprintf "If estimated layer time is below ~%ds, fan will run at 100%% and print speed will be reduced so that no less than %ds are spent on that layer (however, speed will never be reduced below %dmm/s).",
             $config->slowdown_below_layer_time, $config->slowdown_below_layer_time, $config->min_print_speed;
@@ -587,11 +620,9 @@ sub _update_description {
             $msg .= sprintf "\nIf estimated layer time is greater, but still below ~%ds, fan will run at a proportionally decreasing speed between %d%% and %d%%.",
                 $config->fan_below_layer_time, $config->max_fan_speed, $config->min_fan_speed;
         }
-        if ($config->fan_always_on) {
-            $msg .= sprintf "\nDuring the other layers, fan will always run at %d%%.", $config->min_fan_speed;
-        } else {
-            $msg .= "\nDuring the other layers, fan will be turned off."
-        }
+        $msg .= "\nDuring the other layers, fan $fan_other_layers"
+    } else {
+        $msg = "Fan $fan_other_layers";
     }
     $self->{description_line}->SetText($msg);
 }
@@ -671,8 +702,8 @@ sub build {
     $self->_build_extruder_pages;
 }
 
-sub _extruder_options { qw(nozzle_diameter extruder_offset retract_length retract_lift retract_speed retract_restart_extra retract_before_travel
-    retract_length_toolchange retract_restart_extra_toolchange) }
+sub _extruder_options { qw(nozzle_diameter extruder_offset retract_length retract_lift retract_speed retract_restart_extra retract_before_travel wipe
+    retract_layer_change retract_length_toolchange retract_restart_extra_toolchange) }
 
 sub config {
     my $self = shift;
@@ -705,7 +736,7 @@ sub _build_extruder_pages {
                 title => 'Retraction',
                 options => [
                     map "${_}#${extruder_idx}",
-                        qw(retract_length retract_lift retract_speed retract_restart_extra retract_before_travel)
+                        qw(retract_length retract_lift retract_speed retract_restart_extra retract_before_travel retract_layer_change wipe)
                 ],
             },
             {
@@ -761,9 +792,9 @@ sub on_preset_loaded {
     }
 }
 
-sub load_external_config {
+sub load_config_file {
     my $self = shift;
-    $self->SUPER::load_external_config(@_);
+    $self->SUPER::load_config_file(@_);
     
     Slic3r::GUI::warning_catcher($self)->(
         "Your configuration was imported. However, Slic3r is currently only able to import settings "
